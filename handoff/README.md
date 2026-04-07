@@ -60,59 +60,90 @@ parent to lend its position but not its rotation, or vice versa.
 
 ## How the math works
 
-Each frame, the expression computes the *incremental* contribution from the
-previous frame and adds it to the accumulator stored in the property's
-previous-frame value:
+Each frame, the expression computes the full integral from time 0 through
+the current time of the weighted parent velocity, and adds that offset to
+the host's own `value`:
 
 ```
-offset(t) = offset(t - dt) + Σ_parents  weight(t) · Δworld_transform
+offset(t) = Σ_parents  ∫₀ᵗ  weight(s) · (d/ds parent.toWorld(anchor, s))  ds
+result(t) = value + offset(t)
 ```
 
-The previous frame's accumulator is recovered via:
+The integral for each parent is split into segments at the boundaries of
+that parent's weight keyframes. On a segment where the weight is constant
+(typical: before a fade begins, or after it ends), the integral has a
+closed form:
 
-```javascript
-thisProperty.valueAtTime(t - dt) - thisProperty.valueAtTime(t - dt, true)
+```
+segment_offset = (parent.toWorld(anchor, tB) - parent.toWorld(anchor, tA)) · weight
 ```
 
-The second call returns the *pre-expression* value (the layer's own keyframed
-value at that time). This separates "the layer's animated value" from "what
-this expression has added to it."
+On a segment where the weight varies (the crossfade window itself), the
+integral is evaluated as a midpoint Riemann sum over individual frames —
+slower, but accurate through the transition.
 
-This gives **O(1) work per frame and O(frames) total render cost**. The
-naive integration approach (recompute `∫₀ⁿᵒʷ` every frame) is O(frames²).
+Per-frame cost is `O(weight keyframes)` in the fast path and
+`O(frames within variable segments)` in the slow path. Total render cost
+is approximately `O(frames × weight keyframes)` — typically a handful of
+keyframes per parent, so in practice it scales near-linearly with comp
+length.
 
-- **Position** integrates as additive world-space vectors via `toWorld()`.
-- **Rotation** integrates as additive degrees, derived from the angle of a
+- **Position** integrates weighted world-space vector deltas via `toWorld()`.
+- **Rotation** integrates weighted degree deltas derived from `atan2` of a
   parent-local unit vector after `toWorld()`. Wraparound (359° → 1°) is
-  corrected by clamping the per-frame delta to ±180°.
-- **Scale** integrates as a multiplicative ratio per axis, derived from the
-  length of parent-local basis vectors after `toWorld()`. Combined in log
-  space inside the accumulator so multiple parents combine cleanly, then
-  exponentiated back at output.
+  corrected by clamping per-segment deltas to ±180° via `unwrap()`.
+- **Scale** integrates in log space: weighted `log(scale_ratio)` per axis,
+  derived from the length of parent-local basis vectors after `toWorld()`.
+  Multiple parents combine cleanly by log-sum, then the output is
+  `value ⊙ exp(log_offset)` component-wise.
 
-All three expressions use AE's `add` / `sub` / `mul` / `length` vector helpers
-and are compatible with both the **Legacy** and **V8** expression engines.
+All three expressions use AE's `add` / `sub` / `mul` / `length` vector
+helpers and are compatible with both the **Legacy** and **V8** expression
+engines.
+
+> **Why not recursive delta?** An earlier draft tried
+> `thisProperty.valueAtTime(t - dt)` to recursively accumulate a per-frame
+> offset for `O(frames)` total cost. Live testing in AE 2025 confirmed that
+> the expression engine does NOT feed the expression's previous-frame
+> output back into itself through this call — the recursive lookup returns
+> the raw keyframed value instead, and the accumulator collapses to a
+> single frame's worth of delta. The segment-based approach above avoids
+> recursion entirely and is verified to work in-engine.
 
 ## Limitations
 
 - **Comp must start at time 0.** The expressions assume `t=0` is the
   reference state. If your work area starts later, the rig still works but
   the "rest position" is the layer's value at frame 0.
+- **Variable-weight segments introduce a small residual offset.** The
+  crossfade window is integrated by midpoint Riemann sum, which is a
+  first-order approximation. In live testing, a 15-frame crossfade between
+  two hands yielded about 1 px of residual offset that is then carried
+  forward (which is the correct "sticky" behavior — once the handoff
+  completes, the layer stays locked to the new parent from wherever it
+  landed). Shorter crossfades reduce the residual; longer ones may
+  accumulate a noticeable offset.
 - **Scale is unsigned.** Flipped layers (negative scale) are not handled
   correctly because we extract scale from `length()` of basis vectors.
 - **Rotation is 2D only.** The script attaches to `ADBE Rotate Z`. For 3D
   layers with X/Y/Z rotation, only Z is rigged.
-- **Recursive `valueAtTime`** can have a one-time walkback cost when scrubbing
-  cold frames. After the cache warms up, subsequent frames are O(1).
-- **Time remapping and looping comps** may break the recursive accumulator
-  because they violate the "previous frame is the temporal predecessor"
-  assumption.
+- **Host layer can't have keyframes on the rigged property.** The rig
+  adds its computed offset to `value`, which is the host's rest position.
+  If you keyframe the host's own position while it's rigged, the host's
+  keyframes will animate underneath the rig's contribution — usually
+  not what you want. Animate a parent layer instead, or bake the rig.
 
 ## History
 
 The original Handoff script integrated weight × velocity over the entire
-timeline on every single frame, with O(frames²) total render cost and a
-correctness bug under the V8 expression engine (array `+`/`-`/`*` operators
-don't work in V8). This rewrite uses recursive-delta accumulation for O(frames)
-cost, fixes the V8 bug, and extends the rig to cover rotation and scale in
-addition to position. See the git log for the full diff.
+timeline on every single frame and had a correctness bug under the V8
+expression engine: array `+`/`-`/`*` operators do string concatenation or
+NaN instead of component-wise math. This rewrite fixes the V8 bug, extends
+the rig from position-only to all three transform channels (position,
+rotation, scale), adds the shared-vs-individual weight mode, drops the
+PresetEffects.xml pseudo-effect install dependency in favor of programmatic
+control creation, and was live-verified in AE 2025 against a handoff
+between two animated hand layers. See the git log for the full diff,
+including an interim recursive-delta attempt that was reverted after live
+testing showed AE's expression engine does not support the recursion
+pattern it relied on.
