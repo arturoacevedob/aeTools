@@ -381,25 +381,6 @@
         'out;'
     ].join('\n');
 
-    // ---- Mutual-exclusion clamp expressions on sub-controls ------------------
-    //
-    // AE blocks us from graying out pseudo-effect sub-parameters at runtime
-    // (canSetEnabled is false on those properties). The next best thing:
-    // attach a 1-line clamp expression to each sub-control that forces its
-    // value to 0 when it\'s in the "disabled" mode. The control stays
-    // visually editable but its effective value is 0.
-    //
-    //   - P{n} Weight forced to 0 when P{n} Use Individual Weights is ON
-    //   - P{n} Position/Scale/Rotation forced to 0 when the checkbox is OFF
-
-    function sharedWeightClamp(p) {
-        return 'effect("' + EFFECT_NAME + '")("' + nUseIndiv(p) + '").value > 0.5 ? 0 : value';
-    }
-
-    function individualWeightClamp(p) {
-        return 'effect("' + EFFECT_NAME + '")("' + nUseIndiv(p) + '").value > 0.5 ? value : 0';
-    }
-
     // ---- Embedded Handoff.ffx animation preset ------------------------------
     //
     // The pseudo effect's binary .ffx is embedded directly in this script
@@ -1697,26 +1678,18 @@
         // 3. Apply the pseudo effect. This auto-registers Pseudo/PEM Matchname
         //    in AE\'s runtime if not already registered.
         layer.applyPreset(ffxFile);
-
-        // 4. Attach mutual-exclusion clamp expressions to the sub-controls.
-        //    Re-acquire the effect reference each iteration since we may be
-        //    touching many of its properties in sequence.
-        var handoff = findHandoffEffect(layer);
-        if (handoff === null) {
+        if (findHandoffEffect(layer) === null) {
             throw new Error("applyPreset did not install the Handoff effect.");
         }
-        for (var p = 1; p <= SLOTS; p++) {
-            var sharedW = handoff.property(nWeight(p));
-            var posW    = handoff.property(nPosWeight(p));
-            var sclW    = handoff.property(nSclWeight(p));
-            var rotW    = handoff.property(nRotWeight(p));
-            if (sharedW) { sharedW.expression = sharedWeightClamp(p); }
-            if (posW)    { posW.expression    = individualWeightClamp(p); }
-            if (sclW)    { sclW.expression    = individualWeightClamp(p); }
-            if (rotW)    { rotW.expression    = individualWeightClamp(p); }
-        }
 
-        // 5. Attach the three transform expressions.
+        // 4. Attach the three transform expressions. The position/rotation/
+        //    scale expressions internally call wPropFor(p, channel) which
+        //    reads each parent\'s "Use Individual Weights" checkbox and
+        //    picks the active slider — shared P{n} Weight when off,
+        //    per-channel P{n} Position/Rotation/Scale when on. Mutual
+        //    exclusion is handled inside the expression math, so the
+        //    sub-controls themselves carry no expressions and a user
+        //    pressing EE on the layer sees just these three rows.
         var tg  = layer.property("ADBE Transform Group");
         tg.property("ADBE Position").expression  = EXPR_POSITION;
         tg.property("ADBE Rotate Z").expression  = EXPR_ROTATION;

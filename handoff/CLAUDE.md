@@ -44,8 +44,12 @@ These broke earlier rewrites. Don't rediscover them.
   already registered. Register via `layer.applyPreset(File)` with a `.ffx`
   containing the definition (Smart Rekt / rendertom pattern).
 - **Pseudo effect sub-properties** — `canSetEnabled = false`. You CANNOT
-  gray out a sub-property at runtime. Workaround: clamp expressions on the
-  controls themselves to force values to 0 in inactive modes.
+  gray out a sub-property at runtime. We considered clamp expressions on
+  the controls as a workaround but rejected it: 20+ expression badges
+  cluttering the layer when the user presses EE is worse than no visual
+  feedback. The position/rotation/scale expressions handle mutual
+  exclusion mathematically via `wPropFor(p, channel)` instead — only the
+  three transform properties carry expressions.
 - **`applyPreset(file)` selection requirement** — target layer must be the
   SOLE selection, or AE creates a new Solid layer for the preset. Always
   `selectOnly(layer)` first.

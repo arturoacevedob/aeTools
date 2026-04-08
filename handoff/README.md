@@ -74,13 +74,15 @@ mix shared and individual modes across parent slots — e.g., parent 1 uses
 shared weight, parent 2 contributes only position via the individual
 slider.
 
-When the checkbox is OFF, the individual sliders are clamped to 0 by an
-expression on each one (so they have no effect on the rig). When the
-checkbox is ON, the shared weight slider is clamped to 0 the same way.
-This mutual-exclusion is purely cosmetic — only one mode is "live" for
-each parent at any time, even though all sliders are visually editable.
-(AE doesn't let scripts gray out pseudo-effect sub-parameters at runtime;
-this clamp pattern is the closest approximation.)
+Mutual exclusion between shared and individual modes is handled inside
+the position/rotation/scale expressions themselves, not via expressions
+on the sub-controls. The integration logic reads each parent's checkbox
+once per frame and picks either `P{n} Weight` (shared mode) or the
+relevant per-channel slider (individual mode) — whichever is "live" for
+that parent. The unused slider's value is simply ignored. Pressing **EE**
+on a Handoff'd layer reveals exactly three expressions (Position,
+Rotation, Scale) instead of dozens of clamp expressions on every
+sub-control.
 
 ## How the math works
 
