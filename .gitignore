@@ -1,1 +1,6 @@
 .DS_Store
+
+# Local-only reference materials (Adobe docs, scripting guides, etc.)
+# Kept out of the repo to avoid bloating git history with large third-party
+# content. If you want any of this committed, remove the entry below.
+resources/

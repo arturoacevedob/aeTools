@@ -70,20 +70,25 @@
     // ---- Control naming ------------------------------------------------------
     //
     // Programmatic effect creation. No pseudo effect dependency. Each rigged
-    // layer gets these 26 expression controls at the top level of its Effect
-    // Controls panel:
+    // layer gets 6 expression controls per parent slot, added in order so
+    // each parent's controls are visually adjacent in the Effect Controls
+    // panel:
     //
-    //   Layer 1..5             — Layer Control, picks the parent layer
-    //   Weight 1..5            — Slider, shared weight (0..1) for parent N
-    //   Use Individual Weights — Checkbox
-    //   Pos Weight 1..5        — Slider, position-only weight when checkbox on
-    //   Rot Weight 1..5        — Slider, rotation-only weight when checkbox on
-    //   Scale Weight 1..5      — Slider, scale-only weight when checkbox on
+    //   Layer N          — Layer Control, picks the parent layer
+    //   Weight N         — Slider, shared weight (0..1) for parent N
+    //   Use Individual N — Checkbox, toggles per-channel weights for this parent
+    //   Pos Weight N     — Slider, position weight (used when Use Individual N on)
+    //   Rot Weight N     — Slider, rotation weight (used when Use Individual N on)
+    //   Scale Weight N   — Slider, scale weight (used when Use Individual N on)
+    //
+    // With SLOTS=3, that's 18 top-level effects per rigged layer. Set SLOTS
+    // higher if you need more parent slots — the math and the expressions
+    // scale automatically.
 
-    var SLOTS           = 5;
+    var SLOTS           = 3;
     var NAME_LAYER      = "Layer ";
     var NAME_WEIGHT     = "Weight ";
-    var NAME_USE_INDIV  = "Use Individual Weights";
+    var NAME_USE_INDIV  = "Use Individual ";
     var NAME_POS_WEIGHT = "Pos Weight ";
     var NAME_ROT_WEIGHT = "Rot Weight ";
     var NAME_SCL_WEIGHT = "Scale Weight ";
@@ -96,11 +101,14 @@
     //
     // Every property's expression starts with these helpers. Defining them as
     // a single block keeps the three expression bodies short and consistent.
+    //
+    // The Use Individual toggle is per-parent: each parent slot has its own
+    // checkbox, so you can drive position from one parent and rotation from
+    // another.
 
     var EXPR_PREAMBLE = [
         'var dt = thisComp.frameDuration;',
         'var L = thisLayer;',
-        'var useIndiv = L.effect("' + NAME_USE_INDIV + '")(1).value > 0.5;',
         '',
         '// Clamp any weight value into the valid [0, 1] range.',
         '// Applied at every read site so out-of-range slider values',
@@ -112,9 +120,11 @@
         '    return w;',
         '}',
         '',
-        '// Resolve weight for this channel (shared or individual)',
+        '// Resolve weight for parent p on this channel — reads the per-parent',
+        '// Use Individual N checkbox and picks the appropriate slider.',
         'function W(p, indivName) {',
-        '    var name = useIndiv ? (indivName + p) : ("' + NAME_WEIGHT + '" + p);',
+        '    var indiv = L.effect("' + NAME_USE_INDIV + '" + p)(1).value > 0.5;',
+        '    var name  = indiv ? (indivName + p) : ("' + NAME_WEIGHT + '" + p);',
         '    return clamp01(L.effect(name)(1).value);',
         '}',
         ''
@@ -134,9 +144,12 @@
         '    return segs;',
         '}',
         '',
-        '// Get the effect name for parent slot p on this channel',
+        '// Resolve the effect name for parent slot p on this channel.',
+        '// Reads the per-parent "Use Individual N" checkbox: if on, returns',
+        '// the individual-channel slider name; if off, the shared Weight N.',
         'function wName(p, indivName) {',
-        '    return useIndiv ? (indivName + p) : ("' + NAME_WEIGHT + '" + p);',
+        '    var indiv = L.effect("' + NAME_USE_INDIV + '" + p)(1).value > 0.5;',
+        '    return indiv ? (indivName + p) : ("' + NAME_WEIGHT + '" + p);',
         '}',
         ''
     ].join('\n');
@@ -386,18 +399,21 @@
     }
 
     function applyRig(layer) {
-        // Layer pickers + shared weights
+        // First, strip any pre-existing rig controls (including the legacy
+        // 5-parent layout with the global "Use Individual Weights" checkbox).
+        // This keeps applyRig idempotent across schema changes and makes
+        // parent ordering consistent after a re-apply.
+        removeRig(layer);
+
+        // Create each parent's 6 controls consecutively so they sit together
+        // in the Effect Controls panel.
         for (var p = 1; p <= SLOTS; p++) {
-            ensureControl(layer, NAME_LAYER  + p, MN_LAYER);
-            ensureControl(layer, NAME_WEIGHT + p, MN_SLIDER, 0);
-        }
-        // Mode toggle
-        ensureControl(layer, NAME_USE_INDIV, MN_CHECKBOX);
-        // Per-channel weights (only used when toggle is on)
-        for (var q = 1; q <= SLOTS; q++) {
-            ensureControl(layer, NAME_POS_WEIGHT + q, MN_SLIDER, 0);
-            ensureControl(layer, NAME_ROT_WEIGHT + q, MN_SLIDER, 0);
-            ensureControl(layer, NAME_SCL_WEIGHT + q, MN_SLIDER, 0);
+            ensureControl(layer, NAME_LAYER      + p, MN_LAYER);
+            ensureControl(layer, NAME_WEIGHT     + p, MN_SLIDER,   0);
+            ensureControl(layer, NAME_USE_INDIV  + p, MN_CHECKBOX);
+            ensureControl(layer, NAME_POS_WEIGHT + p, MN_SLIDER,   0);
+            ensureControl(layer, NAME_ROT_WEIGHT + p, MN_SLIDER,   0);
+            ensureControl(layer, NAME_SCL_WEIGHT + p, MN_SLIDER,   0);
         }
 
         // Attach the three expressions
@@ -407,36 +423,49 @@
         tg.property("ADBE Scale").expression     = EXPR_SCALE;
     }
 
+    // Patterns matching every effect name this script manages. removeRig
+    // uses these to clean up any rig on the layer, including the legacy
+    // 5-parent layout (which had a single "Use Individual Weights" global
+    // checkbox at the top level — matched by the LEGACY_EXACT list).
+    var MANAGED_PATTERNS = [
+        /^Layer \d+$/,
+        /^Weight \d+$/,
+        /^Use Individual \d+$/,
+        /^Pos Weight \d+$/,
+        /^Rot Weight \d+$/,
+        /^Scale Weight \d+$/
+    ];
+    var LEGACY_EXACT = [
+        "Use Individual Weights" // legacy pre-per-parent global checkbox
+    ];
+
+    function isManagedEffect(name) {
+        for (var i = 0; i < MANAGED_PATTERNS.length; i++) {
+            if (MANAGED_PATTERNS[i].test(name)) { return true; }
+        }
+        for (var j = 0; j < LEGACY_EXACT.length; j++) {
+            if (name === LEGACY_EXACT[j]) { return true; }
+        }
+        return false;
+    }
+
     function removeRig(layer) {
-        // Clear expressions first
+        // Clear expressions first so they don't hold references to controls
+        // we're about to delete.
         var tg = layer.property("ADBE Transform Group");
         var props = ["ADBE Position", "ADBE Rotate Z", "ADBE Scale"];
         for (var i = 0; i < props.length; i++) {
             var pr = tg.property(props[i]);
-            if (pr.expressionEnabled) pr.expression = "";
+            if (pr.expressionEnabled) { pr.expression = ""; }
         }
 
-        // Remove all controls we created (matched by name)
-        var names = [];
-        for (var p = 1; p <= SLOTS; p++) {
-            names.push(NAME_LAYER  + p);
-            names.push(NAME_WEIGHT + p);
-        }
-        names.push(NAME_USE_INDIV);
-        for (var q = 1; q <= SLOTS; q++) {
-            names.push(NAME_POS_WEIGHT + q);
-            names.push(NAME_ROT_WEIGHT + q);
-            names.push(NAME_SCL_WEIGHT + q);
-        }
-
+        // Remove any managed controls. Iterate in reverse so removal by
+        // index doesn't shift the yet-to-visit entries.
         var fxPar = layer.property("ADBE Effect Parade");
         for (var n = fxPar.numProperties; n >= 1; n--) {
             var fxName = fxPar.property(n).name;
-            for (var k = 0; k < names.length; k++) {
-                if (fxName === names[k]) {
-                    fxPar.property(n).remove();
-                    break;
-                }
+            if (isManagedEffect(fxName)) {
+                fxPar.property(n).remove();
             }
         }
     }
