@@ -1738,6 +1738,7 @@
         var row = panel.add("group");
         row.orientation = "row";
         row.alignChildren = ["fill", "fill"];
+        row.alignment = ["fill", "top"];
         row.spacing = 4;
         row.margins = 0;
 
@@ -1749,6 +1750,7 @@
         var xBtn = row.add("button", undefined, "\u2715");
         xBtn.preferredSize = [32, 32];
         xBtn.maximumSize = [32, 32];
+        xBtn.minimumSize = [32, 32];
         xBtn.alignment = ["right", "fill"];
         xBtn.helpTip = "Remove dynamic parenting from selected layers";
 
@@ -1815,7 +1817,22 @@
             }
         };
 
+        // Set a sensible minimum so AE's panel system lets the user shrink
+        // the dock without collapsing the controls. Width: X button (32) +
+        // spacing (4) + a small "Handoff" label (~80) + margins (12) = ~128.
+        // Height: button (32) + margins (12) = 44.
+        panel.minimumSize = [128, 44];
+
+        // Initial layout, then re-flow on every panel resize. ScriptUI does
+        // NOT auto-relayout when the dock changes size — you have to call
+        // layout.resize() from an onResizing handler explicitly. Without
+        // this, the buttons stay frozen at their initial width.
         panel.layout.layout(true);
+        panel.layout.resize();
+        panel.onResizing = panel.onResize = function () {
+            this.layout.resize();
+        };
+
         if (!(panel instanceof Panel)) {
             panel.center();
             panel.show();
