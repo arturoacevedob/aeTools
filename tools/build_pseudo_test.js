@@ -79,7 +79,7 @@ var EXPR_SCL = "${jsLiteral(cap.scl)}";
 var HANDOFF_FFX_BINARY = "${binaryLiteral(cap.bin)}";
 
 function ensureFFX() {
-    var dir = new Folder(Folder.userData.fsName + "/aeScripts/Handoff");
+    var dir = new Folder(Folder.userData.fsName + "/aeTools/Handoff");
     if (!dir.exists) { dir.create(); }
     var ffx = new File(dir.fsName + "/Handoff.ffx");
     var needsWrite = !ffx.exists || ffx.length !== HANDOFF_FFX_BINARY.length;

@@ -1,6 +1,6 @@
-# aeScripts
+# aeTools
 
-A collection of After Effects scripts and tools, each in its own folder.
+A collection of After Effects scripts, pseudo-effect rigs, and dev tools.
 
 ## Scripts
 
@@ -13,6 +13,9 @@ A collection of After Effects scripts and tools, each in its own folder.
 Each script lives in its own subfolder with a `README.md`, the `.jsx` file(s),
 and any supporting assets. Scripts are independent and have no shared
 dependencies.
+
+`tools/` holds dev helpers shared across scripts (e.g. `embed_ffx.js` for
+re-embedding pseudo-effect binaries into single-file deliverables).
 
 ## Installation (general)
 

@@ -36,7 +36,7 @@ anywhere.
 > `PresetEffects.xml` editing, no `.ffx` sidecar, no AE restart beyond the
 > first one. The pseudo effect is embedded inside the script as a binary
 > blob; on first run it gets cached to
-> `~/Library/Application Support/aeScripts/Handoff/Handoff.ffx` and
+> `~/Library/Application Support/aeTools/Handoff/Handoff.ffx` and
 > applied via `layer.applyPreset()`. Same pattern as Smart Rekt, Overlord,
 > and other widely-distributed AE scripts.
 

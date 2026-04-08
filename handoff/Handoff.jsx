@@ -405,7 +405,7 @@
     // The pseudo effect's binary .ffx is embedded directly in this script
     // as a JavaScript string of \xHH escape sequences. On first run we
     // decode it, write the bytes to a cache file under
-    // Folder.userData/aeScripts/Handoff/, and apply the cached preset.
+    // Folder.userData/aeTools/Handoff/, and apply the cached preset.
     // Subsequent runs reuse the cached file.
     //
     // This means end users only need a single Handoff.jsx file — no
@@ -1588,7 +1588,7 @@
         "\x6F\x72\x22\x3A\x5B\x0A\x0A\x5D\x7D\x5D\x2C\x22\x76\x65\x72\x73\x69\x6F\x6E\x22\x3A\x33\x7D";
     // EMBED:END handoff_ffx_binary
 
-    var FFX_CACHE_DIR  = "aeScripts/Handoff";
+    var FFX_CACHE_DIR  = "aeTools/Handoff";
     var FFX_CACHE_NAME = "Handoff.ffx";
 
     function ensureFFX() {
@@ -1604,7 +1604,7 @@
             if (HANDOFF_FFX_BINARY.length === 0) {
                 throw new Error(
                     "Embedded Handoff.ffx is empty. Run `node tools/embed_ffx.js` "
-                    + "from the aeScripts repo root to populate it from "
+                    + "from the aeTools repo root to populate it from "
                     + "handoff/Handoff.ffx, then reload this script."
                 );
             }
