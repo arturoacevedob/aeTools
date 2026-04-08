@@ -39,24 +39,48 @@ root `CLAUDE.md` AND the script's `CLAUDE.md` are loaded.
   AI-assistant context.
 - **Never auto-commit.** Only commit when explicitly asked.
 
-## Versioning
+## Versioning (semver, in the filename)
 
-The `VERSION` file at the repo root holds the collection's current version
-(e.g., `1.0`). Every script's `SCRIPT_VERSION` constant in its `.jsx`
-mirrors this value and is shown in the script's Window title and helpTip.
+The version lives in **two places**, kept in lockstep:
 
-**Bump the version on every commit.** Workflow:
+1. **`VERSION`** at the repo root — single line, e.g. `1.0.1`
+2. **The `.jsx` filename** — e.g. `handoff/Handoff v1.0.1.jsx`
+
+There is intentionally NO `SCRIPT_VERSION` constant inside the script
+source. The filename IS the version, which means AE shows it
+automatically in the **`Window` menu** and the **docked panel tab title**
+without the script having to render anything in its UI. Script display
+names stay clean ("Handoff", not "Handoff v1.0.1") forever — only the
+filename carries the version.
+
+**Bump the version on every commit**, choosing the right segment:
+
+| Bump | When | Example |
+|---|---|---|
+| `patch` (default) | Small fixes: typos, doc tweaks, refactors with no behavior change | `1.0.5 → 1.0.6` |
+| `minor` | New features, schema additions, anything backwards-compatible | `1.0.5 → 1.1.0` |
+| `major` | Breaking changes: removed parameters, renamed pseudo-effect matchnames without legacy cleanup, anything that breaks existing rigs in user projects | `1.5.3 → 2.0.0` |
+
+Workflow:
 
 ```bash
-node tools/bump_version.js   # adds 0.1, updates VERSION + every .jsx target
+node tools/bump_version.js          # patch (default)
+node tools/bump_version.js minor    # bump minor, reset patch
+node tools/bump_version.js major    # bump major, reset minor + patch
 git add -A
 git commit -m "..."
 git push
 ```
 
-`tools/bump_version.js` parses the current version as a decimal, adds
-0.1, formats with `toFixed(1)` (so 1.9 → 2.0 cleanly with no float drift),
-writes the new value to `VERSION`, and replaces the
-`var SCRIPT_VERSION = "X.Y";` line in every script registered in the
-`JSX_TARGETS` array inside the bump tool. Add new script `.jsx` files to
-that array as the collection grows.
+`tools/bump_version.js` parses the current version, increments the
+requested segment (resetting lower segments per semver), writes the
+new value to `VERSION`, and **renames** every script registered in the
+`SCRIPTS` array inside the bump tool (e.g.
+`Handoff v1.0.4.jsx` → `Handoff v1.0.5.jsx`). Add new scripts to that
+array as the collection grows. Each entry has `dir`, `prefix`, and
+`suffix` — the bump tool finds the current versioned filename via glob
+and renames it in place.
+
+Other tools that need to read a script's source (`embed_ffx.js`,
+`build_pseudo_test.js`) also use the same glob pattern to locate the
+current versioned `.jsx` file, so renames don't break them.

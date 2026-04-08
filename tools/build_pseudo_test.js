@@ -8,7 +8,23 @@ const fs = require('fs');
 const path = require('path');
 
 const ROOT = path.resolve(__dirname, '..');
-const JSX  = path.join(ROOT, 'handoff', 'Handoff.jsx');
+
+// The .jsx filename carries the version (e.g. "Handoff v1.0.5.jsx") and
+// gets renamed by tools/bump_version.js on each commit. Find it via glob.
+function findHandoffJsx() {
+    const dir = path.join(ROOT, 'handoff');
+    const files = fs.readdirSync(dir).filter(f => /^Handoff v\d+\.\d+\.\d+\.jsx$/.test(f));
+    if (files.length === 0) {
+        console.error('ERROR: no "Handoff v*.jsx" file found in ' + dir);
+        process.exit(1);
+    }
+    if (files.length > 1) {
+        console.error('ERROR: multiple "Handoff v*.jsx" files in ' + dir + ' — clean up old versions:\n  ' + files.join('\n  '));
+        process.exit(1);
+    }
+    return path.join(dir, files[0]);
+}
+const JSX = findHandoffJsx();
 
 const src = fs.readFileSync(JSX, 'utf8');
 
