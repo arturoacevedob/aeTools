@@ -1,6 +1,6 @@
 /*
     Handoff — ScriptUI Panel
-    Version: 1.1.1
+    Version: 1.1.2
 
     Weighted, switchable, sticky dynamic parenting for After Effects.
 
@@ -2066,28 +2066,27 @@
         layer.selected = true;
     }
 
-    // At rig-apply time, sample each parent slot's current world transform
-    // and the child's keyframed rest pose at t=0. The resulting values get
-    // prepended to the EXPR_POSITION / EXPR_ROTATION / EXPR_SCALE strings as
-    // `HANDOFF_BAKED_*` JS literals, which the expressions reference as a
-    // fixed reference for rigid-attachment fallback when a parent has no
-    // transform keyframes. Without the bake, a static parent shows no motion
-    // inheritance because lyr.toWorld and lyr.fromWorld both use the same
-    // current parent transform (round-trip identity) -- so dragging the
-    // parent in the viewport during rig setup produces no visual feedback.
+    // At rig-apply time, sample each parent slot\'s world transform and the
+    // child\'s keyframed rest pose at t=0. The resulting values are prepended
+    // to EXPR_POSITION / EXPR_ROTATION / EXPR_SCALE as `HANDOFF_BAKED_*` JS
+    // literals. The expressions use these as a fixed reference for:
     //
-    // The bake is computed via a throwaway null layer with an expression
-    // string that calls toWorld/fromWorld on the target parent. We read the
-    // post-expression value of the null, then remove it. Each sample uses
-    // the live parent transform at comp time 0.
+    //   1. The rigid-attachment fallback for static (non-keyframed) parents.
+    //      Without the bake, lyr.toWorld and lyr.fromWorld both use the same
+    //      current parent transform (round-trip identity), so dragging a
+    //      static parent in the viewport produces no visual feedback.
+    //   2. Apply-time anchoring. The rig\'s output is offset so that at the
+    //      moment the rig is applied / refreshed, the layer doesn\'t jump.
+    //
+    // Implementation note: this function does ALL the transform math in
+    // ExtendScript directly via layer.transform.*.valueAtTime(0). No temp
+    // null layer, no expression-engine probe. A previous version created a
+    // throwaway "__handoff_bake__" null and ran expression strings on it —
+    // that left orphan nulls if anything upstream crashed, and made the
+    // apply flow look messy. The manual math below handles parent-of-parent
+    // chains recursively by composing each layer\'s local transform with
+    // its ancestor\'s world transform.
     function computeBakes(layer, fx) {
-        var comp = layer.containingComp;
-        var tmpNull = comp.layers.addNull();
-        tmpNull.name = "__handoff_bake__";
-        // Use stock ExtendScript property access — propByMatchPath is an
-        // atom-ae runtime helper that doesn\'t exist in plain AE sessions.
-        var probePos = tmpNull.property("ADBE Transform Group").property("ADBE Position");
-
         // Child rest pose at t=0, read pre-expression (raw keyframed value).
         // For separated dimensions we read each scalar and assemble a vector.
         var childRest;
@@ -2118,41 +2117,133 @@
                 bakes.scaleP.push([1, 1]);
                 continue;
             }
+            var parentLayer = layer.containingComp.layer(layerIdx);
 
-            // Baked local point: parent.fromWorld(childRest, 0). This is the
-            // child's rest pose expressed in the parent's local frame at
-            // apply time -- the "sticky attachment" point for the rigid
-            // fallback.
-            probePos.expression =
-                "var ly = thisComp.layer(" + layerIdx + "); " +
-                "ly.fromWorld([" + childRest[0] + "," + childRest[1] + "," + childRest[2] + "], 0);";
-            var L = probePos.valueAtTime(0, false);
-            bakes.localP.push([L[0], L[1], L[2] || 0]);
+            // pLocal = parent.fromWorld(childRest, 0). Manual recursive
+            // inverse transform that walks the parent chain from the top
+            // down — converts childRest from world to the leaf layer\'s
+            // local coordinate frame, passing through each ancestor.
+            bakes.localP.push(worldToLayerLocal(parentLayer, childRest, 0));
 
-            // Baked world rotation: angle of parent's X basis vector at t=0.
-            probePos.expression =
-                "var ly = thisComp.layer(" + layerIdx + "); " +
-                "var p0 = ly.toWorld([0, 0], 0); " +
-                "var p1 = ly.toWorld([100, 0], 0); " +
-                "[radiansToDegrees(Math.atan2(p1[1] - p0[1], p1[0] - p0[0])), 0, 0];";
-            var R = probePos.valueAtTime(0, false);
-            bakes.rotP.push(R[0]);
+            // Parent\'s world Z rotation at t=0, accumulated through the
+            // parent chain.
+            bakes.rotP.push(accumulatedRotation(parentLayer, 0));
 
-            // Baked world scale factors: length of parent's X and Y basis at
-            // t=0, normalized by the 100 px basis length.
-            probePos.expression =
-                "var ly = thisComp.layer(" + layerIdx + "); " +
-                "var p0 = ly.toWorld([0, 0], 0); " +
-                "var px = ly.toWorld([100, 0], 0); " +
-                "var py = ly.toWorld([0, 100], 0); " +
-                "[length(sub(px, p0)) / 100, length(sub(py, p0)) / 100, 0];";
-            var S = probePos.valueAtTime(0, false);
-            bakes.scaleP.push([S[0], S[1]]);
+            // Parent\'s world X/Y scale at t=0, accumulated through the
+            // parent chain (multiplicative).
+            bakes.scaleP.push(accumulatedScale(parentLayer, 0));
         }
 
-        probePos.expression = "";
-        tmpNull.remove();
         return bakes;
+    }
+
+    // --- Pure ExtendScript transform math helpers ----------------------------
+    //
+    // After Effects\' transform order (per layer, from local to world): subtract
+    // anchor point, scale, rotate around origin (Z axis), translate by position.
+    // We replicate that pipeline and its inverse here for bake sampling.
+    //
+    // These helpers are 2D-only (Z rotation, X/Y scale); 3D-layer parents are
+    // handled as 2D for bake purposes, which matches the rotation/scale
+    // channels of the existing Option B walker.
+
+    // Apply a layer\'s local-to-local-of-parent transform (at a given time) to
+    // a point. This maps a point from the layer\'s "pre-transform" local frame
+    // to the frame that the layer\'s PARENT sees as local.
+    function layerLocalToParentSpace(lyr, localPt, time) {
+        var tg  = lyr.property("ADBE Transform Group");
+        var anc = tg.property("ADBE Anchor Point").valueAtTime(time, false);
+        var pos = tg.property("ADBE Position").valueAtTime(time, false);
+        var scl = tg.property("ADBE Scale").valueAtTime(time, false);
+        var rot = tg.property("ADBE Rotate Z").valueAtTime(time, false);
+
+        // Step 1: subtract anchor
+        var rx = localPt[0] - anc[0];
+        var ry = localPt[1] - anc[1];
+
+        // Step 2: scale
+        var sx = (scl[0] || 0) / 100;
+        var sy = (scl[1] || 0) / 100;
+        rx *= sx;
+        ry *= sy;
+
+        // Step 3: rotate around origin (Z)
+        var theta = (rot || 0) * Math.PI / 180;
+        var cT = Math.cos(theta);
+        var sT = Math.sin(theta);
+        var xr = rx * cT - ry * sT;
+        var yr = rx * sT + ry * cT;
+
+        // Step 4: translate by position
+        return [xr + pos[0], yr + pos[1]];
+    }
+
+    // Inverse of layerLocalToParentSpace.
+    function parentSpaceToLayerLocal(lyr, parentPt, time) {
+        var tg  = lyr.property("ADBE Transform Group");
+        var anc = tg.property("ADBE Anchor Point").valueAtTime(time, false);
+        var pos = tg.property("ADBE Position").valueAtTime(time, false);
+        var scl = tg.property("ADBE Scale").valueAtTime(time, false);
+        var rot = tg.property("ADBE Rotate Z").valueAtTime(time, false);
+
+        // Inverse of step 4: subtract position
+        var rx = parentPt[0] - pos[0];
+        var ry = parentPt[1] - pos[1];
+
+        // Inverse of step 3: rotate by -theta
+        var theta = -(rot || 0) * Math.PI / 180;
+        var cT = Math.cos(theta);
+        var sT = Math.sin(theta);
+        var xr = rx * cT - ry * sT;
+        var yr = rx * sT + ry * cT;
+
+        // Inverse of step 2: divide by scale
+        var sx = (scl[0] || 0) / 100;
+        var sy = (scl[1] || 0) / 100;
+        if (Math.abs(sx) > 1e-9) { xr /= sx; }
+        if (Math.abs(sy) > 1e-9) { yr /= sy; }
+
+        // Inverse of step 1: add anchor
+        return [xr + anc[0], yr + anc[1], 0];
+    }
+
+    // Convert a point from WORLD (comp) space to the given layer\'s local frame,
+    // walking up through any ancestor parents. Equivalent to `lyr.fromWorld`
+    // in the expression engine.
+    function worldToLayerLocal(lyr, worldPt, time) {
+        // Recurse from the root: if lyr has a parent, convert world to the
+        // parent\'s local first, then to lyr\'s local.
+        var pt = worldPt;
+        if (lyr.parent !== null) {
+            pt = worldToLayerLocal(lyr.parent, pt, time);
+        }
+        return parentSpaceToLayerLocal(lyr, pt, time);
+    }
+
+    // Accumulated Z rotation through the parent chain, at a given time.
+    // Used for the bake\'s baseline `worldRot` at apply time.
+    function accumulatedRotation(lyr, time) {
+        var r = lyr.property("ADBE Transform Group").property("ADBE Rotate Z").valueAtTime(time, false) || 0;
+        if (lyr.parent !== null) {
+            r += accumulatedRotation(lyr.parent, time);
+        }
+        return r;
+    }
+
+    // Accumulated world X/Y scale factors through the parent chain, at a
+    // given time. Multiplicative composition: child_world_scale =
+    // child_local_scale * parent_world_scale. Used for the bake\'s baseline
+    // `worldScale` at apply time. Returned as unit ratios (1.0 = 100%).
+    function accumulatedScale(lyr, time) {
+        var scl = lyr.property("ADBE Transform Group").property("ADBE Scale").valueAtTime(time, false);
+        var sx = (scl[0] || 0) / 100;
+        var sy = (scl[1] || 0) / 100;
+        if (lyr.parent !== null) {
+            var ps = accumulatedScale(lyr.parent, time);
+            sx *= ps[0];
+            sy *= ps[1];
+        }
+        return [sx, sy];
     }
 
     // Format bake data as a JS prefix string that gets prepended to each
