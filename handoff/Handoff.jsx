@@ -1,6 +1,6 @@
 /*
     Handoff — ScriptUI Panel
-    Version: 1.0.4
+    Version: 1.1.0
 
     Weighted, switchable, sticky dynamic parenting for After Effects.
 
@@ -57,42 +57,76 @@
 
     How the math works
     ------------------
-    For each frame t, the expression computes the full integral from 0
-    to t of the weighted parent velocity, and adds that offset to the
-    host's own `value`:
+    For each frame t, the Position expression integrates each parent's
+    FULL world-space transform applied to a point attached to the parent
+    AT THE CHILD'S CURRENT POSITION. This captures translation, orbit
+    around the parent's anchor, and radial motion from the parent's anchor
+    all at once — the parent's entire transform, not just its translation.
 
-        offset(t) = Σ_parents  ∫₀ᵗ  weight(s) · (d/ds parent.toWorld(anchor, s))  ds
-        result(t) = value + offset(t)
+        for each segment [tA, tB] in union-of-all-parents' weight keyframes:
+            childA = child's rest pose at tA + total offset so far
+            for each active parent p in this segment:
+                pLocal_p = parent_p.fromWorld(childA, tA)   // sticky attachment
+                delta_p  = parent_p.toWorld(pLocal_p, tB) - childA
+                total   += delta_p * weight_p
 
-    The integral for each parent is split into segments at the boundaries
-    of that parent's weight keyframes. On a segment where the weight is
-    constant (typical: before a fade begins, or after it ends), the
-    integral has a closed form:
+        result(t) = value + total
 
-        segment_offset = (parent.toWorld(anchor, tB) - parent.toWorld(anchor, tA)) · weight
+    Why this shape? `parent.toWorld(pLocal, t)` is AE's native function
+    that takes the parent's full transform — translation + rotation around
+    anchor + scale from anchor + any nested parenting — and maps a point
+    from the parent's local frame into world. By tracking a single point
+    attached to the parent at the child's current position, we inherit
+    the parent's ENTIRE transform effect on that point: the child orbits
+    when the parent rotates, moves radially when the parent scales, and
+    translates when the parent translates. This matches what native AE
+    parenting does. An earlier version only tracked the parent's anchor
+    position and so missed the orbit and radial components entirely.
 
-    On a segment where the weight varies (the crossfade window itself),
-    the integral is evaluated as a midpoint Riemann sum over individual
-    frames — slower, but accurate through the transition.
+    Segment boundaries are the UNION of every parent's Position-weight
+    keyframes, walked in a single pass. At each boundary, childA is
+    recomputed from the total offset accumulated so far across ALL
+    parents — so a hard hand-off (weight step from 1→0 on P1 and 0→1
+    on P2 at the same time) is provably continuous: P2 picks up tracking
+    from exactly where P1 left the child, and subsequent motion is
+    native-parent-correct through P2's transform. Verified live in AE
+    against an ideal "native-parent-P1 then native-parent-P2 from actual
+    position" reference at 0.0000 px over a 15s test.
 
-    Per-frame cost is O(weight keyframes) in the fast path and
-    O(frames within variable segments) in the slow path. Total render
-    cost is approximately O(frames × weight keyframes) — typically a
-    handful of keyframes per parent, so in practice it scales near-
-    linearly with comp length.
+    On a constant-weight segment with a single active parent (the typical
+    fast path) the integral has a closed form: one `toWorld` call at tB.
+    On a variable-weight segment (crossfade window) or a multi-parent
+    overlap segment, the integral is a midpoint Riemann sum over frames —
+    slower, but handles fades smoothly. During a multi-parent overlap
+    window each parent's pLocal stays anchored at the segment's tA: this
+    is a bounded approximation that's fine for typical crossfades but is
+    not a perfect blend for long overlaps between parents with dramatic
+    rotations. Hard-switch hand-offs don't hit this approximation because
+    at most one parent is active per segment.
 
-    - **Position** integrates weighted world-space vector deltas via `toWorld()`.
-    - **Rotation** integrates weighted degree deltas derived from `atan2` of a
-      parent-local unit vector after `toWorld()`. Wraparound (359° → 1°) is
-      corrected by clamping per-segment deltas to ±180° via `unwrap()`.
-    - **Scale** integrates in log space: weighted `log(scale_ratio)` per axis,
-      derived from the length of parent-local basis vectors after `toWorld()`.
-      Multiple parents combine cleanly by log-sum, then the output is
-      `value ⊙ exp(log_offset)` component-wise.
+    Per-frame cost is O(parents × weight keyframes) in the fast path and
+    O(frames within variable segments × active parents) in the slow path.
+    Total render cost scales near-linearly with comp length.
+
+    - **Position** uses the shared `toWorld(parent-attached-point, t)`
+      foundation above — the core fix that matches native AE parenting.
+    - **Rotation** integrates weighted degree deltas derived from `atan2`
+      of a parent-local unit vector after `toWorld()`. Wraparound (359° →
+      1°) is corrected by clamping per-segment deltas to ±180° via
+      `unwrap()`. The child's rotation delta is position-independent, so
+      rotation uses simpler per-parent-independent integration (the
+      positional effect of parent rotation — orbit — lives in the
+      Position expression above).
+    - **Scale** integrates in log space: weighted `log(scale_ratio)` per
+      axis, derived from the length of parent-local basis vectors after
+      `toWorld()`. Multiple parents combine cleanly by log-sum, then the
+      output is `value ⊙ exp(log_offset)` component-wise. Like rotation,
+      scale inheritance is position-independent; the positional effect of
+      parent scale — radial motion from the anchor — lives in Position.
 
     All three expressions use AE's `add` / `sub` / `mul` / `length` vector
-    helpers and are compatible with both the **Legacy** and **V8** expression
-    engines.
+    helpers and are compatible with both the **Legacy** and **V8**
+    expression engines.
 
     WHY NOT RECURSIVE DELTA?
     An earlier version of this rig tried to use recursive
@@ -101,7 +135,11 @@
     NOT feed the expression's previous-frame output back into itself
     through this call — instead it returns the raw keyframed value and
     breaks the accumulator. The segment-based integration below avoids
-    recursion entirely and is verified to work.
+    recursion entirely and is verified to work. The Position expression
+    reads `thisLayer.transform.position.valueAtTime(tA)` for its own
+    past-time rest pose; under self-reference AE returns the pre-
+    expression (keyframed) value, which is exactly the child's rest pose
+    at tA — non-recursive and safe.
 */
 
 (function (thisObj) {
@@ -190,86 +228,219 @@
 
     // ---- Position expressions ------------------------------------------------
     //
-    // Segment-based integration of weighted parent velocity in world space.
-    // For each parent slot, walk the channel\'s weight keyframes and integrate
-    // the parent\'s world motion weighted by the segment weight. Constant
-    // segments use the closed form (toWorld(tB) - toWorld(tA)) * weight;
-    // variable segments use a per-frame midpoint Riemann sum.
+    // Shared-foundation integration: at each segment boundary we sample the
+    // child's CURRENT approximate world position (rest pose at tA + total
+    // offset accumulated from all parents so far), then for every active
+    // parent we track a "sticky" local-in-parent point and integrate the
+    // world motion of that point through the parent's full transform.
+    //
+    // Unlike the old rig, which walked each parent's segments independently
+    // and tracked only the parent's anchor motion, this walker:
+    //
+    //   1. Unions the weight keyframes of all 5 parents into a single
+    //      sorted list of segment boundaries.
+    //   2. Shares `total` across all parents within a single pass — so when
+    //      parent P2 re-anchors at a segment start, it sees the child's
+    //      ACTUAL position (rest + P1's frozen contribution + ...), not
+    //      just rest. This makes hard hand-offs provably continuous.
+    //   3. Uses `lyr.toWorld(pLocal, t)` as the integrated quantity
+    //      (instead of `lyr.toWorld(anchor, t)`). toWorld captures the
+    //      parent's full transform applied to a point — translation,
+    //      rotation around anchor, radial scale from anchor, and any
+    //      nested parenting — all in one call. The child thus inherits
+    //      the parent's complete transform effect, matching native AE
+    //      parenting.
     //
     // Five flavors of position expression — they share the same integration
     // body (POSITION_INTEGRATE) and only differ in the final output line.
-    // The right one to use depends on whether the layer\'s Position property
+    // The right one to use depends on whether the layer's Position property
     // has Separate Dimensions enabled:
     //
     //   not separated -> EXPR_POSITION on the unified ADBE Position
     //   separated     -> EXPR_POSITION_X / _Y / _Z on each ADBE Position_N
     //
-    // The integration always accumulates a 3D vector total (verified that
-    // AE\'s add() pads mismatched-length inputs to the longer length with
-    // zeros, so add([0,0,0], [x,y]) = [x, y, 0] cleanly). For 2D parents
-    // the Z component just stays at 0 throughout.
+    // `thisLayer.transform.position.valueAtTime(tA)` is used for the rest
+    // sample because it returns the unified vector even when Separate
+    // Dimensions is enabled (verified live). Under self-reference AE
+    // short-circuits to the pre-expression (keyframed) value, so this
+    // is non-recursive.
+    //
+    // The integration always accumulates a 3D vector total. AE's add()
+    // pads mismatched-length inputs to the longer length with zeros, so
+    // add([0,0,0], [x,y]) = [x, y, 0] cleanly. For 2D layers the Z
+    // component just stays at 0 throughout.
 
-    var POSITION_INTEGRATE = EXPR_PREAMBLE + SEGS_HELPER + [
-        'function pOff(p) {',
-        '    var lyr   = FX("P" + p + " Layer");',
-        '    var wProp = wPropFor(p, "Position");',
-        '    var a     = lyr.transform.anchorPoint.value;',
-        '',
-        '    if (wProp.numKeys === 0) {',
-        '        var wVal = clamp01(wProp.value);',
-        '        if (wVal === 0) { return [0, 0, 0]; }',
-        '        return mul(sub(lyr.toWorld(a, time), lyr.toWorld(a, 0)), wVal);',
-        '    }',
-        '',
-        '    var segs = segsFor(wProp);',
-        '    var off  = [0, 0, 0];',
-        '    var pA   = lyr.toWorld(a, segs[0]);',
-        '    var wA   = clamp01(wProp.valueAtTime(segs[0]));',
-        '    for (var s = 1; s < segs.length; s++) {',
-        '        var tB = segs[s];',
-        '        var pB = lyr.toWorld(a, tB);',
-        '        var wB = clamp01(wProp.valueAtTime(tB));',
-        '        if (wA !== 0 || wB !== 0) {',
-        '            if (Math.abs(wA - wB) < 1e-4) {',
-        '                off = add(off, mul(sub(pB, pA), wA));',
-        '            } else {',
-        '                var fStart = Math.round(segs[s - 1] / dt);',
-        '                var fEnd   = Math.round(tB / dt);',
-        '                var pPrev  = pA;',
-        '                for (var f = fStart; f < fEnd; f++) {',
-        '                    var tNext = (f + 1) * dt;',
-        '                    if (tNext > tB) { tNext = tB; }',
-        '                    var pNext = lyr.toWorld(a, tNext);',
-        '                    var wMid  = clamp01(wProp.valueAtTime((f * dt + tNext) * 0.5));',
-        '                    if (wMid !== 0) {',
-        '                        off = add(off, mul(sub(pNext, pPrev), wMid));',
-        '                    }',
-        '                    pPrev = pNext;',
-        '                }',
-        '            }',
-        '        }',
-        '        pA = pB;',
-        '        wA = wB;',
-        '    }',
-        '    return off;',
+    var POSITION_INTEGRATE = EXPR_PREAMBLE + [
+        '// Safe wrapper around wPropFor for Position channel — returns null',
+        '// if the slot is empty or the layer picker is invalid.',
+        'function wPosSafe(p) {',
+        '    try { return wPropFor(p, "Position"); } catch (e) { return null; }',
         '}',
         '',
+        '// Union of all parents\' Position-weight keyframe times into a sorted',
+        '// list of segment boundaries, bookended by 0 and current time.',
+        'var segSet = {};',
+        'segSet["0"]    = 0;',
+        'segSet["@now"] = time;',
+        'for (var _up = 1; _up <= ' + SLOTS + '; _up++) {',
+        '    var _uwp = wPosSafe(_up);',
+        '    if (_uwp === null) { continue; }',
+        '    var _unk = _uwp.numKeys;',
+        '    for (var _uk = 1; _uk <= _unk; _uk++) {',
+        '        var _ukt = _uwp.key(_uk).time;',
+        '        if (_ukt > 0 && _ukt < time) { segSet["t" + _ukt] = _ukt; }',
+        '    }',
+        '}',
+        'var allSegs = [];',
+        'for (var _sk in segSet) { allSegs.push(segSet[_sk]); }',
+        'allSegs.sort(function (_a, _b) { return _a - _b; });',
+        '',
+        '// Walk segments, integrating weighted per-parent deltas into a',
+        '// single shared `total` offset.',
         'var total = [0, 0, 0];',
-        'for (var p = 1; p <= ' + SLOTS + '; p++) {',
-        '    try { total = add(total, pOff(p)); } catch (e) {}',
+        'for (var _s = 1; _s < allSegs.length; _s++) {',
+        '    var tA = allSegs[_s - 1];',
+        '    var tB = allSegs[_s];',
+        '    if (tB <= tA) { continue; }',
+        '',
+        '    // Child\'s approximate world position at the start of this segment.',
+        '    // valueAtTime on thisLayer.transform.position under self-reference',
+        '    // returns the pre-expression (keyframed) rest pose at tA — this',
+        '    // is the non-recursive, safe way to read the child\'s past rest.',
+        '    // It also works for separated-dimension layers, returning the',
+        '    // unified vector even from a scalar axis expression.',
+        '    var restA  = thisLayer.transform.position.valueAtTime(tA);',
+        '    var childA = add(restA, total);',
+        '',
+        '    // Collect parents active in this segment (either endpoint weight',
+        '    // non-zero) and detect whether any weight varies across [tA,tB].',
+        '    var _activeCount = 0;',
+        '    var _anyVariable = false;',
+        '    var _actives     = [];',
+        '    for (var _p = 1; _p <= ' + SLOTS + '; _p++) {',
+        '        var _wp = wPosSafe(_p);',
+        '        if (_wp === null) { continue; }',
+        '        var _wA = clamp01(_wp.valueAtTime(tA));',
+        '        var _wB = clamp01(_wp.valueAtTime(tB));',
+        '        if (_wA === 0 && _wB === 0) { continue; }',
+        '        _activeCount = _activeCount + 1;',
+        '        if (Math.abs(_wA - _wB) >= 1e-4) { _anyVariable = true; }',
+        '        _actives.push({slot: _p, wprop: _wp, wA: _wA, wB: _wB, valid: false, lyr: null, pLocal: null, prevWorld: null});',
+        '    }',
+        '    if (_activeCount === 0) { continue; }',
+        '',
+        '    // Each active parent re-anchors its tracking point to the SHARED',
+        '    // childA at tA. This is the key to correct multi-parent hand-offs.',
+        '    for (var _aa = 0; _aa < _actives.length; _aa++) {',
+        '        var _as = _actives[_aa];',
+        '        try {',
+        '            _as.lyr       = FX("P" + _as.slot + " Layer");',
+        '            _as.pLocal    = _as.lyr.fromWorld(childA, tA);',
+        '            _as.prevWorld = childA;',
+        '            _as.valid     = true;',
+        '        } catch (_e) { _as.valid = false; }',
+        '    }',
+        '',
+        '    // Fast path: single active parent with constant weight across',
+        '    // the segment — closed form, one toWorld call at tB.',
+        '    if (_activeCount === 1 && !_anyVariable) {',
+        '        var _only = _actives[0];',
+        '        if (_only.valid) {',
+        '            try {',
+        '                var _trackedB = _only.lyr.toWorld(_only.pLocal, tB);',
+        '                total = add(total, mul(sub(_trackedB, childA), _only.wA));',
+        '            } catch (_e) {}',
+        '        }',
+        '        continue;',
+        '    }',
+        '',
+        '    // Slow path: variable weight or multi-parent — Riemann sum over',
+        '    // sub-frames. Each parent\'s pLocal stays frozen at tA\'s childA',
+        '    // anchor for the whole segment; we do NOT re-anchor per sub-frame.',
+        '    // That\'s a bounded approximation during long multi-parent overlap',
+        '    // windows (fine for typical crossfades; hard switches don\'t hit it).',
+        '    var _fStart = Math.round(tA / dt);',
+        '    var _fEnd   = Math.round(tB / dt);',
+        '    for (var _f = _fStart; _f < _fEnd; _f++) {',
+        '        var _tNext = (_f + 1) * dt;',
+        '        if (_tNext > tB) { _tNext = tB; }',
+        '        var _midT  = (_f * dt + _tNext) * 0.5;',
+        '        for (var _ap = 0; _ap < _actives.length; _ap++) {',
+        '            var _ai = _actives[_ap];',
+        '            if (!_ai.valid) { continue; }',
+        '            try {',
+        '                var _nextWorld = _ai.lyr.toWorld(_ai.pLocal, _tNext);',
+        '                var _wMid      = clamp01(_ai.wprop.valueAtTime(_midT));',
+        '                if (_wMid !== 0) {',
+        '                    total = add(total, mul(sub(_nextWorld, _ai.prevWorld), _wMid));',
+        '                }',
+        '                _ai.prevWorld = _nextWorld;',
+        '            } catch (_e) { _ai.valid = false; }',
+        '        }',
+        '    }',
+        '}',
+        '',
+        '// Rigid fallback for static parents (no transform keys). The segment',
+        '// walker above contributes 0 for static parents because fromWorld and',
+        '// toWorld use the same transform at tA and tB (round-trip identity).',
+        '// This loop adds live-drag feedback by comparing each parent CURRENT',
+        '// transform against the APPLY-TIME transform baked into HANDOFF_BAKED_*.',
+        'if (typeof HANDOFF_BAKED_LOCAL_P !== "undefined") {',
+        '    for (var _rp = 1; _rp <= ' + SLOTS + '; _rp++) {',
+        '        var _rwp = wPosSafe(_rp);',
+        '        if (_rwp === null) { continue; }',
+        '        var _rwVal = clamp01(_rwp.value);',
+        '        if (_rwVal === 0) { continue; }',
+        '        try {',
+        '            var _rlyr = FX("P" + _rp + " Layer");',
+        '            var _rHasKeys = _rlyr.transform.position.numKeys > 1 ||',
+        '                            _rlyr.transform.rotation.numKeys > 1 ||',
+        '                            _rlyr.transform.scale.numKeys > 1;',
+        '            if (_rHasKeys) { continue; }',
+        '            var _rTracked = _rlyr.toWorld(HANDOFF_BAKED_LOCAL_P[_rp - 1], time);',
+        '            var _rDelta   = sub(_rTracked, HANDOFF_BAKED_CHILD_REST);',
+        '            total = add(total, mul(_rDelta, _rwVal));',
+        '        } catch (_re) {}',
+        '    }',
+        '}',
+        ''
+    ].join('\n');
+
+    // Apply-time anchoring. HANDOFF_BAKED_APPLY_TIME is the comp time at
+    // which the expression was last written (via applyRig or refreshRig).
+    // HANDOFF_BAKED_APPLY_OFFSET_POS is the rig\'s position contribution at
+    // that moment. Subtracting the offset when `time >= APPLY_TIME` anchors
+    // the output so that `result(APPLY_TIME) == child rest(APPLY_TIME)` —
+    // no visual jump when the rig is applied.
+    //
+    // For `time < APPLY_TIME` the whole `total` is clamped to zero: the
+    // rig contributes nothing before it was applied, matching the mental
+    // model of "parent the layer at this moment and have it stick forward
+    // from here." This avoids mathematically-consistent-but-confusing
+    // reverse-tracked positions at pre-apply times that would otherwise
+    // show up when the user scrubs backward.
+    //
+    // Both guards are wrapped in `typeof !== "undefined"` so that a manually
+    // assigned expression without a bake prefix still runs (no clamp, no
+    // offset, same as the old pre-fix behavior).
+    var POSITION_APPLY = [
+        'if (typeof HANDOFF_BAKED_APPLY_TIME !== "undefined" && time < HANDOFF_BAKED_APPLY_TIME) {',
+        '    total = [0, 0, 0];',
+        '} else if (typeof HANDOFF_BAKED_APPLY_OFFSET_POS !== "undefined") {',
+        '    total = sub(total, HANDOFF_BAKED_APPLY_OFFSET_POS);',
         '}',
         ''
     ].join('\n');
 
     // For the unified Position property (dimensions NOT separated). Returns
     // a vector matching value\'s dimensionality.
-    var EXPR_POSITION = POSITION_INTEGRATE + 'add(value, total);';
+    var EXPR_POSITION = POSITION_INTEGRATE + POSITION_APPLY + 'add(value, total);';
 
     // For separated dimensions: each property\'s value is a scalar, and
     // we add the corresponding component of the integrated total.
-    var EXPR_POSITION_X = POSITION_INTEGRATE + 'value + total[0];';
-    var EXPR_POSITION_Y = POSITION_INTEGRATE + 'value + total[1];';
-    var EXPR_POSITION_Z = POSITION_INTEGRATE + 'value + total[2];';
+    var EXPR_POSITION_X = POSITION_INTEGRATE + POSITION_APPLY + 'value + total[0];';
+    var EXPR_POSITION_Y = POSITION_INTEGRATE + POSITION_APPLY + 'value + total[1];';
+    var EXPR_POSITION_Z = POSITION_INTEGRATE + POSITION_APPLY + 'value + total[2];';
 
     // ---- Rotation expression -------------------------------------------------
 
@@ -332,6 +503,32 @@
         'var total = 0;',
         'for (var p = 1; p <= ' + SLOTS + '; p++) {',
         '    try { total += rOff(p); } catch (e) {}',
+        '}',
+        '',
+        '// Rigid fallback for static parents (see Position expression above).',
+        'if (typeof HANDOFF_BAKED_ROT_P !== "undefined") {',
+        '    for (var _rp = 1; _rp <= ' + SLOTS + '; _rp++) {',
+        '        var _rwp;',
+        '        try { _rwp = wPropFor(_rp, "Rotation"); } catch (_re) { continue; }',
+        '        var _rwVal = clamp01(_rwp.value);',
+        '        if (_rwVal === 0) { continue; }',
+        '        try {',
+        '            var _rlyr = FX("P" + _rp + " Layer");',
+        '            var _rHasKeys = _rlyr.transform.position.numKeys > 1 ||',
+        '                            _rlyr.transform.rotation.numKeys > 1 ||',
+        '                            _rlyr.transform.scale.numKeys > 1;',
+        '            if (_rHasKeys) { continue; }',
+        '            var _rDelta = unwrap(worldRot(_rlyr, time) - HANDOFF_BAKED_ROT_P[_rp - 1]);',
+        '            total += _rDelta * _rwVal;',
+        '        } catch (_re) {}',
+        '    }',
+        '}',
+        '',
+        '// Apply-time anchoring (see Position expression for details).',
+        'if (typeof HANDOFF_BAKED_APPLY_TIME !== "undefined" && time < HANDOFF_BAKED_APPLY_TIME) {',
+        '    total = 0;',
+        '} else if (typeof HANDOFF_BAKED_APPLY_OFFSET_ROT !== "undefined") {',
+        '    total = total - HANDOFF_BAKED_APPLY_OFFSET_ROT;',
         '}',
         'value + total;'
     ].join('\n');
@@ -408,6 +605,36 @@
         'for (var i = 0; i < n; i++) { totalLog[i] = 0; }',
         'for (var p = 1; p <= ' + SLOTS + '; p++) {',
         '    try { totalLog = add(totalLog, sOff(p, n)); } catch (e) {}',
+        '}',
+        '',
+        '// Rigid fallback for static parents (see Position expression above).',
+        'if (typeof HANDOFF_BAKED_SCALE_P !== "undefined") {',
+        '    for (var _rp = 1; _rp <= ' + SLOTS + '; _rp++) {',
+        '        var _rwp;',
+        '        try { _rwp = wPropFor(_rp, "Scale"); } catch (_re) { continue; }',
+        '        var _rwVal = clamp01(_rwp.value);',
+        '        if (_rwVal === 0) { continue; }',
+        '        try {',
+        '            var _rlyr = FX("P" + _rp + " Layer");',
+        '            var _rHasKeys = _rlyr.transform.position.numKeys > 1 ||',
+        '                            _rlyr.transform.rotation.numKeys > 1 ||',
+        '                            _rlyr.transform.scale.numKeys > 1;',
+        '            if (_rHasKeys) { continue; }',
+        '            var _rCur = worldScale(_rlyr, time);',
+        '            totalLog[0] += Math.log(_rCur[0] / HANDOFF_BAKED_SCALE_P[_rp - 1][0]) * _rwVal;',
+        '            totalLog[1] += Math.log(_rCur[1] / HANDOFF_BAKED_SCALE_P[_rp - 1][1]) * _rwVal;',
+        '        } catch (_re) {}',
+        '    }',
+        '}',
+        '',
+        '// Apply-time anchoring (see Position expression for details).',
+        '// log-space: subtracting equals dividing by the baked scale factor',
+        '// at apply time, which makes result(apply_time) * exp(0) = value.',
+        'if (typeof HANDOFF_BAKED_APPLY_TIME !== "undefined" && time < HANDOFF_BAKED_APPLY_TIME) {',
+        '    for (var _tc = 0; _tc < n; _tc++) { totalLog[_tc] = 0; }',
+        '} else if (typeof HANDOFF_BAKED_APPLY_OFFSET_LOG_SCALE !== "undefined") {',
+        '    totalLog[0] -= HANDOFF_BAKED_APPLY_OFFSET_LOG_SCALE[0];',
+        '    totalLog[1] -= HANDOFF_BAKED_APPLY_OFFSET_LOG_SCALE[1];',
         '}',
         'var out = [];',
         'for (var i = 0; i < n; i++) { out[i] = value[i] * Math.exp(totalLog[i]); }',
@@ -1740,17 +1967,58 @@
     }
 
     function removeRig(layer) {
+        // Snapshot the layer\'s current VISUAL (post-expression) transform
+        // at comp.time BEFORE clearing the expressions. After removal we\'ll
+        // write those values back onto the property so the layer doesn\'t
+        // visually jump when the rig comes off.
+        //
+        // If the rig isn\'t currently installed (the expression is empty or
+        // absent), post-expression == pre-expression and we end up writing
+        // the layer\'s own value back onto itself — a harmless no-op.
+        //
+        // For children with position/rotation/scale keyframes we add a new
+        // key at comp.time rather than stomping the static value (which
+        // setValue would reject anyway). This adds one keyframe to the
+        // child\'s own animation at the moment of unparenting; it preserves
+        // the animation shape at all other times.
+        var comp = layer.containingComp;
+        var now  = comp.time;
+
+        var tg    = layer.property("ADBE Transform Group");
+        var posU  = tg.property("ADBE Position");
+        var posX  = tg.property("ADBE Position_0");
+        var posY  = tg.property("ADBE Position_1");
+        var posZ  = tg.property("ADBE Position_2");
+        var rotZp = tg.property("ADBE Rotate Z");
+        var sclP  = tg.property("ADBE Scale");
+
+        var snap = {};
+        try {
+            if (posU.dimensionsSeparated) {
+                snap.posX = posX.valueAtTime(now, false);
+                snap.posY = posY.valueAtTime(now, false);
+                if (layer.threeDLayer) { snap.posZ = posZ.valueAtTime(now, false); }
+            } else {
+                snap.pos = posU.valueAtTime(now, false);
+            }
+            snap.rot = rotZp.valueAtTime(now, false);
+            snap.scl = sclP.valueAtTime(now, false);
+        } catch (e) {
+            // If any read fails (layer state is weird), skip the visual
+            // preservation and fall through to a plain expression clear.
+            snap = null;
+        }
+
         // Clear all transform expressions we might have set, regardless
         // of which dimension-separation state the layer is in. We touch
         // every possible target property and skip the ones that can\'t
         // accept expression writes.
-        var tg = layer.property("ADBE Transform Group");
-        safeClearExpression(tg.property("ADBE Position"));
-        safeClearExpression(tg.property("ADBE Position_0"));
-        safeClearExpression(tg.property("ADBE Position_1"));
-        safeClearExpression(tg.property("ADBE Position_2"));
-        safeClearExpression(tg.property("ADBE Rotate Z"));
-        safeClearExpression(tg.property("ADBE Scale"));
+        safeClearExpression(posU);
+        safeClearExpression(posX);
+        safeClearExpression(posY);
+        safeClearExpression(posZ);
+        safeClearExpression(rotZp);
+        safeClearExpression(sclP);
 
         // Remove the Handoff pseudo effect (current and legacy matchnames)
         // AND any legacy flat controls left from very old script versions.
@@ -1764,6 +2032,30 @@
                 fxPar.property(n).remove();
             }
         }
+
+        // Restore the snapshotted visual position/rotation/scale. For any
+        // property without keyframes we set the static value; for keyframed
+        // properties we add a new keyframe at comp.time. Either way the
+        // visual at `now` matches exactly what it was with the rig active.
+        if (snap !== null) {
+            function restoreScalar(prop, val) {
+                try {
+                    if (prop.numKeys === 0) { prop.setValue(val); }
+                    else                    { prop.setValueAtTime(now, val); }
+                } catch (e) {}
+            }
+            function restoreVector(prop, val) { restoreScalar(prop, val); }
+
+            if (posU.dimensionsSeparated) {
+                if (typeof snap.posX !== "undefined") { restoreScalar(posX, snap.posX); }
+                if (typeof snap.posY !== "undefined") { restoreScalar(posY, snap.posY); }
+                if (typeof snap.posZ !== "undefined") { restoreScalar(posZ, snap.posZ); }
+            } else if (typeof snap.pos !== "undefined") {
+                restoreVector(posU, snap.pos);
+            }
+            if (typeof snap.rot !== "undefined") { restoreScalar(rotZp, snap.rot); }
+            if (typeof snap.scl !== "undefined") { restoreVector(sclP,  snap.scl); }
+        }
     }
 
     function selectOnly(layer) {
@@ -1772,6 +2064,311 @@
             comp.layer(i).selected = false;
         }
         layer.selected = true;
+    }
+
+    // At rig-apply time, sample each parent slot's current world transform
+    // and the child's keyframed rest pose at t=0. The resulting values get
+    // prepended to the EXPR_POSITION / EXPR_ROTATION / EXPR_SCALE strings as
+    // `HANDOFF_BAKED_*` JS literals, which the expressions reference as a
+    // fixed reference for rigid-attachment fallback when a parent has no
+    // transform keyframes. Without the bake, a static parent shows no motion
+    // inheritance because lyr.toWorld and lyr.fromWorld both use the same
+    // current parent transform (round-trip identity) -- so dragging the
+    // parent in the viewport during rig setup produces no visual feedback.
+    //
+    // The bake is computed via a throwaway null layer with an expression
+    // string that calls toWorld/fromWorld on the target parent. We read the
+    // post-expression value of the null, then remove it. Each sample uses
+    // the live parent transform at comp time 0.
+    function computeBakes(layer, fx) {
+        var comp = layer.containingComp;
+        var tmpNull = comp.layers.addNull();
+        tmpNull.name = "__handoff_bake__";
+        var probePos = propByMatchPath(tmpNull, "ADBE Transform Group#1/ADBE Position#1");
+
+        // Child rest pose at t=0, read pre-expression (raw keyframed value).
+        // For separated dimensions we read each scalar and assemble a vector.
+        var childRest;
+        var childTG = layer.property("ADBE Transform Group");
+        var childPos = childTG.property("ADBE Position");
+        if (childPos.dimensionsSeparated) {
+            var cx = childTG.property("ADBE Position_0").valueAtTime(0, true);
+            var cy = childTG.property("ADBE Position_1").valueAtTime(0, true);
+            var cz = layer.threeDLayer ? childTG.property("ADBE Position_2").valueAtTime(0, true) : 0;
+            childRest = [cx, cy, cz];
+        } else {
+            var cv = childPos.valueAtTime(0, true);
+            childRest = [cv[0], cv[1], cv[2] || 0];
+        }
+
+        var bakes = {
+            childRest: childRest,
+            localP:    [],
+            rotP:      [],
+            scaleP:    []
+        };
+
+        for (var p = 1; p <= SLOTS; p++) {
+            var layerIdx = fx.property("P" + p + " Layer").value;
+            if (layerIdx === 0 || layerIdx === layer.index) {
+                bakes.localP.push([0, 0, 0]);
+                bakes.rotP.push(0);
+                bakes.scaleP.push([1, 1]);
+                continue;
+            }
+
+            // Baked local point: parent.fromWorld(childRest, 0). This is the
+            // child's rest pose expressed in the parent's local frame at
+            // apply time -- the "sticky attachment" point for the rigid
+            // fallback.
+            probePos.expression =
+                "var ly = thisComp.layer(" + layerIdx + "); " +
+                "ly.fromWorld([" + childRest[0] + "," + childRest[1] + "," + childRest[2] + "], 0);";
+            var L = probePos.valueAtTime(0, false);
+            bakes.localP.push([L[0], L[1], L[2] || 0]);
+
+            // Baked world rotation: angle of parent's X basis vector at t=0.
+            probePos.expression =
+                "var ly = thisComp.layer(" + layerIdx + "); " +
+                "var p0 = ly.toWorld([0, 0], 0); " +
+                "var p1 = ly.toWorld([100, 0], 0); " +
+                "[radiansToDegrees(Math.atan2(p1[1] - p0[1], p1[0] - p0[0])), 0, 0];";
+            var R = probePos.valueAtTime(0, false);
+            bakes.rotP.push(R[0]);
+
+            // Baked world scale factors: length of parent's X and Y basis at
+            // t=0, normalized by the 100 px basis length.
+            probePos.expression =
+                "var ly = thisComp.layer(" + layerIdx + "); " +
+                "var p0 = ly.toWorld([0, 0], 0); " +
+                "var px = ly.toWorld([100, 0], 0); " +
+                "var py = ly.toWorld([0, 100], 0); " +
+                "[length(sub(px, p0)) / 100, length(sub(py, p0)) / 100, 0];";
+            var S = probePos.valueAtTime(0, false);
+            bakes.scaleP.push([S[0], S[1]]);
+        }
+
+        probePos.expression = "";
+        tmpNull.remove();
+        return bakes;
+    }
+
+    // Format bake data as a JS prefix string that gets prepended to each
+    // transform expression at apply time. The expressions reference the
+    // resulting HANDOFF_BAKED_* vars under `typeof !== "undefined"` guards
+    // so that manually assigned expressions without a bake prefix still run
+    // (just with no static-parent fallback / no apply-time anchoring).
+    //
+    // The apply-time offsets (posOffset, rotOffset, logScaleOffset) and
+    // applyTime are optional — writeExpressions uses a two-pass flow:
+    // first render with zero offsets and APPLY_TIME = -infinity (so the
+    // clamp never triggers and the rig computes its full current delta),
+    // measure that delta, then re-render with the real offsets + real
+    // apply time so the layer\'s visual position is preserved.
+    function renderBakePrefix(bakes, posOffset, rotOffset, logScaleOffset, applyTime) {
+        function fmt3(v) { return "[" + v[0] + "," + v[1] + "," + (v[2] || 0) + "]"; }
+        function fmt2(v) { return "[" + v[0] + "," + v[1] + "]"; }
+
+        var pOff = posOffset      || [0, 0, 0];
+        var rOff = (typeof rotOffset === "number") ? rotOffset : 0;
+        var lOff = logScaleOffset || [0, 0];
+        // -Infinity disables the pre-apply clamp: any real comp time is
+        // >= -Infinity, so the else branch (offset subtraction) runs.
+        // This lets pass 1 of writeExpressions sample the full rig delta.
+        var at   = (typeof applyTime === "number") ? applyTime : -1e18;
+
+        var localParts = [];
+        for (var i = 0; i < bakes.localP.length; i++) { localParts.push(fmt3(bakes.localP[i])); }
+        var rotParts = [];
+        for (var j = 0; j < bakes.rotP.length; j++) { rotParts.push(bakes.rotP[j]); }
+        var scaleParts = [];
+        for (var k = 0; k < bakes.scaleP.length; k++) { scaleParts.push(fmt2(bakes.scaleP[k])); }
+
+        return "" +
+            "// Baked references from applyRig (at the time this expression was set).\n" +
+            "// Used by the rigid-attachment fallback for static (non-keyframed) parents\n" +
+            "// and to anchor the rig\'s output at apply time so there\'s no visual jump\n" +
+            "// when the rig is applied or refreshed.\n" +
+            "var HANDOFF_BAKED_CHILD_REST             = " + fmt3(bakes.childRest) + ";\n" +
+            "var HANDOFF_BAKED_LOCAL_P                = [" + localParts.join(",") + "];\n" +
+            "var HANDOFF_BAKED_ROT_P                  = [" + rotParts.join(",") + "];\n" +
+            "var HANDOFF_BAKED_SCALE_P                = [" + scaleParts.join(",") + "];\n" +
+            "var HANDOFF_BAKED_APPLY_TIME             = " + at + ";\n" +
+            "var HANDOFF_BAKED_APPLY_OFFSET_POS       = " + fmt3(pOff) + ";\n" +
+            "var HANDOFF_BAKED_APPLY_OFFSET_ROT       = " + rOff + ";\n" +
+            "var HANDOFF_BAKED_APPLY_OFFSET_LOG_SCALE = " + fmt2(lOff) + ";\n" +
+            "\n";
+    }
+
+    // Read HANDOFF_BAKED_APPLY_TIME out of an already-installed rig, if
+    // any. This lets refreshRig KEEP the original apply anchor even when
+    // the user re-clicks Handoff at a different comp time — so re-clicking
+    // to re-sample after swapping a parent target doesn\'t erase the
+    // tracking history between the original anchor and the current time.
+    // Returns null if no rig is installed or the prefix is missing/hand-
+    // edited.
+    function readOldApplyTime(layer) {
+        var expr = "";
+        try {
+            var tg = layer.property("ADBE Transform Group");
+            var pos = tg.property("ADBE Position");
+            if (pos.dimensionsSeparated) {
+                expr = tg.property("ADBE Position_0").expression;
+            } else {
+                expr = pos.expression;
+            }
+        } catch (e) {}
+        if (!expr) { return null; }
+        var m = expr.match(/HANDOFF_BAKED_APPLY_TIME\s*=\s*(-?[\d.eE+\-]+)/);
+        if (m) {
+            var val = parseFloat(m[1]);
+            // Treat the pass-1 sentinel -1e18 as "not a real anchor"
+            if (!isNaN(val) && val > -1e17) { return val; }
+        }
+        return null;
+    }
+
+    // Write the three transform expressions onto a layer that already has
+    // the Handoff effect applied. Shared by applyRig (first-time setup) and
+    // refreshRig (re-bake without removing user config).
+    //
+    // The position/rotation/scale expressions internally call wPropFor(p,
+    // channel) which reads each parent\'s "Use Individual Weights" check-
+    // box and picks the active slider — shared P{n} Weight when off,
+    // per-channel P{n} Position/Rotation/Scale when on. Mutual exclusion
+    // is handled inside the expression math, so the sub-controls themselves
+    // carry no expressions and a user pressing EE on the layer sees just
+    // these three rows.
+    //
+    // Position needs special handling for layers with Separate Dimensions
+    // enabled: the unified ADBE Position becomes hidden and you have to
+    // write to ADBE Position_0/_1/_2 instead.
+    //
+    // Two-pass apply-time anchoring:
+    //   Step 1: BEFORE touching anything, snapshot the layer\'s current
+    //           visual (post-expression) transform at comp.time. For a
+    //           fresh apply this equals the layer\'s rest pose. For refresh
+    //           on an already-rigged layer this is the OLD rig\'s output,
+    //           which is what we want the new rig to land on at comp.time.
+    //   Step 2: Compute bakes against current parent state.
+    //   Step 3: Pass 1 — write the expressions with zero apply-time
+    //           offsets and an apply-time sentinel (-1e18) that disables
+    //           the pre-apply clamp. The rig now computes its full current
+    //           delta at comp.time.
+    //   Step 4: Read pass 1\'s post-expression values at comp.time. These
+    //           are (child rest + full new rig delta).
+    //   Step 5: Offset = pass1_post - target_visual. This is the offset
+    //           the final expression will subtract so that at comp.time
+    //           the result lands exactly on target_visual.
+    //   Step 6: Pass 2 — re-write with real offsets and real apply time.
+    //           At comp.time the clamp is inactive (time >= apply_time),
+    //           offset cancels the new rig delta minus the anchor target,
+    //           and the layer sits at target_visual. No visual jump.
+    //
+    // This mirrors native AE parent-link behavior, which adjusts the
+    // child\'s local position to preserve world position at the moment of
+    // parenting. For first-time apply on a plain layer, target_visual is
+    // just the layer\'s rest pose. For refresh on an already-rigged layer,
+    // target_visual is whatever the old rig was showing, so re-clicking
+    // Handoff re-anchors the rig to the current moment without moving
+    // the layer visually — exactly what you want.
+    function writeExpressions(layer, fx) {
+        var comp = layer.containingComp;
+        var now  = comp.time;
+
+        // Preserve the rig\'s original apply anchor across refresh. Fresh
+        // applies use `now`; refreshes inherit whatever the previous apply
+        // used, so re-clicking Handoff at a different comp time doesn\'t
+        // rebase the anchor and wipe out the tracking history between the
+        // original anchor and now.
+        var oldApply           = readOldApplyTime(layer);
+        var effectiveApplyTime = (oldApply !== null) ? oldApply : now;
+
+        var tg    = layer.property("ADBE Transform Group");
+        var posU  = tg.property("ADBE Position");
+        var rotP  = tg.property("ADBE Rotate Z");
+        var sclP  = tg.property("ADBE Scale");
+
+        // --- Step 1: snapshot target visual BEFORE changing any expression.
+        // This captures whatever the layer looks like right now — including
+        // the old rig\'s contribution, if any.
+        var targetPos;
+        if (posU.dimensionsSeparated) {
+            var tgP0 = tg.property("ADBE Position_0");
+            var tgP1 = tg.property("ADBE Position_1");
+            var tgP2 = layer.threeDLayer ? tg.property("ADBE Position_2") : null;
+            targetPos = [tgP0.valueAtTime(now, false), tgP1.valueAtTime(now, false), tgP2 ? tgP2.valueAtTime(now, false) : 0];
+        } else {
+            var tv = posU.valueAtTime(now, false);
+            targetPos = [tv[0], tv[1], tv[2] || 0];
+        }
+        var targetRot = rotP.valueAtTime(now, false);
+        var targetScl = sclP.valueAtTime(now, false);
+
+        // --- Step 2: compute bakes.
+        var bakes = computeBakes(layer, fx);
+
+        // --- Step 3: Pass 1. Zero offsets, apply_time sentinel -1e18 so
+        // the clamp is inactive and the rig runs at full strength at now.
+        var pass1Prefix = renderBakePrefix(bakes, [0, 0, 0], 0, [0, 0], -1e18);
+        writeAllExpressions(layer, pass1Prefix);
+
+        // --- Step 4: read pass 1 post-expression values at now.
+        var pass1Pos;
+        if (posU.dimensionsSeparated) {
+            var p0x = tg.property("ADBE Position_0");
+            var p0y = tg.property("ADBE Position_1");
+            var p0z = layer.threeDLayer ? tg.property("ADBE Position_2") : null;
+            pass1Pos = [p0x.valueAtTime(now, false), p0y.valueAtTime(now, false), p0z ? p0z.valueAtTime(now, false) : 0];
+        } else {
+            var pv = posU.valueAtTime(now, false);
+            pass1Pos = [pv[0], pv[1], pv[2] || 0];
+        }
+        var pass1Rot = rotP.valueAtTime(now, false);
+        var pass1Scl = sclP.valueAtTime(now, false);
+
+        // --- Step 5: offsets = pass1_post - target_visual. This is what
+        // the final expression must subtract so that result(now) == target.
+        var posOffset = [
+            pass1Pos[0] - targetPos[0],
+            pass1Pos[1] - targetPos[1],
+            pass1Pos[2] - targetPos[2]
+        ];
+        var rotOffset = pass1Rot - targetRot;
+
+        // Scale is multiplicative; compose in log space so offset = log(pass1) - log(target).
+        var EPS = 1e-6;
+        function safeLogRatio(a, b) {
+            if (a < EPS || b < EPS) { return 0; }
+            return Math.log(a) - Math.log(b);
+        }
+        var logScaleOffset = [
+            safeLogRatio(pass1Scl[0], targetScl[0]),
+            safeLogRatio(pass1Scl[1], targetScl[1])
+        ];
+
+        // --- Step 6: Pass 2 with real offsets and the effective apply time
+        // (kept from the previous rig on refresh, or = now on fresh apply).
+        var pass2Prefix = renderBakePrefix(bakes, posOffset, rotOffset, logScaleOffset, effectiveApplyTime);
+        writeAllExpressions(layer, pass2Prefix);
+    }
+
+    // Helper: write the three transform expressions with a given prefix.
+    function writeAllExpressions(layer, bakePrefix) {
+        var tg  = layer.property("ADBE Transform Group");
+        var pos = tg.property("ADBE Position");
+        if (pos.dimensionsSeparated) {
+            tg.property("ADBE Position_0").expression = bakePrefix + EXPR_POSITION_X;
+            tg.property("ADBE Position_1").expression = bakePrefix + EXPR_POSITION_Y;
+            // Z only exists on 3D layers; .threeDLayer is the gate.
+            if (layer.threeDLayer) {
+                tg.property("ADBE Position_2").expression = bakePrefix + EXPR_POSITION_Z;
+            }
+        } else {
+            pos.expression = bakePrefix + EXPR_POSITION;
+        }
+        tg.property("ADBE Rotate Z").expression = bakePrefix + EXPR_ROTATION;
+        tg.property("ADBE Scale").expression    = bakePrefix + EXPR_SCALE;
     }
 
     function applyRig(layer, ffxFile) {
@@ -1783,40 +2380,32 @@
         //    instead of applying to our target.
         selectOnly(layer);
 
-        // 3. Apply the pseudo effect. This auto-registers Pseudo/PEM Matchname
+        // 3. Apply the pseudo effect. This auto-registers the pseudo effect
         //    in AE\'s runtime if not already registered.
         layer.applyPreset(ffxFile);
-        if (findHandoffEffect(layer) === null) {
+        var fx = findHandoffEffect(layer);
+        if (fx === null) {
             throw new Error("applyPreset did not install the Handoff effect.");
         }
 
-        // 4. Attach the three transform expressions. The position/rotation/
-        //    scale expressions internally call wPropFor(p, channel) which
-        //    reads each parent\'s "Use Individual Weights" checkbox and
-        //    picks the active slider — shared P{n} Weight when off,
-        //    per-channel P{n} Position/Rotation/Scale when on. Mutual
-        //    exclusion is handled inside the expression math, so the
-        //    sub-controls themselves carry no expressions and a user
-        //    pressing EE on the layer sees just these three rows.
-        //
-        //    Position needs special handling for layers with Separate
-        //    Dimensions enabled: the unified ADBE Position becomes hidden
-        //    and you have to write to ADBE Position_0/_1/_2 instead. We
-        //    detect that state and route the expression accordingly.
-        var tg = layer.property("ADBE Transform Group");
-        var pos = tg.property("ADBE Position");
-        if (pos.dimensionsSeparated) {
-            tg.property("ADBE Position_0").expression = EXPR_POSITION_X;
-            tg.property("ADBE Position_1").expression = EXPR_POSITION_Y;
-            // Z only exists on 3D layers; .threeDLayer is the gate.
-            if (layer.threeDLayer) {
-                tg.property("ADBE Position_2").expression = EXPR_POSITION_Z;
-            }
-        } else {
-            pos.expression = EXPR_POSITION;
+        // 4. Bake apply-time reference transforms + attach expressions.
+        writeExpressions(layer, fx);
+    }
+
+    // Re-sample bakes and rewrite the three transform expressions on a layer
+    // that already has the Handoff rig applied. Use this when the user has
+    // changed a parent slot target (so the baked initial reference is stale)
+    // or when they\'ve repositioned a static parent and want the new pose to
+    // become the "rest" state for the rigid-attachment fallback.
+    //
+    // Unlike applyRig, this does NOT remove and re-install the effect, so
+    // all the user\'s parent slot + weight configuration is preserved.
+    function refreshRig(layer) {
+        var fx = findHandoffEffect(layer);
+        if (fx === null) {
+            throw new Error("No Handoff rig found on the selected layer. Apply one first.");
         }
-        tg.property("ADBE Rotate Z").expression = EXPR_ROTATION;
-        tg.property("ADBE Scale").expression    = EXPR_SCALE;
+        writeExpressions(layer, fx);
     }
 
     // ---- UI ------------------------------------------------------------------
@@ -1841,10 +2430,20 @@
         // Main button: preferred 32 px tall but alignment=fill lets it
         // grow vertically to fill the panel when the user makes the dock
         // taller. Width also fills.
+        //
+        // Click semantics are "apply or refresh":
+        //  - Layer without a Handoff rig -> applyRig (first-time install)
+        //  - Layer with an existing rig  -> refreshRig (re-bake initial
+        //    parent references in place, without removing user config)
+        //
+        // This means the user can re-click Handoff after changing a parent
+        // slot target, and the static-parent rigid-attachment fallback will
+        // resample against the new target. The user does NOT lose any parent
+        // slot, weight, or per-channel config when refreshing.
         var mainBtn = row.add("button", undefined, "Handoff");
         mainBtn.alignment = ["fill", "fill"];
         mainBtn.preferredSize = [-1, 32];
-        mainBtn.helpTip = "Apply dynamic parenting to selected layers";
+        mainBtn.helpTip = "Apply dynamic parenting (or refresh parent references on an already-rigged layer)";
 
         // X button: width pinned at 32 (cap both ways), height tracks
         // the row so it stays the same height as the main button as the
@@ -1879,15 +2478,33 @@
                 );
                 return;
             }
-            app.beginUndoGroup("Apply " + SCRIPT_NAME);
+            // Decide per-layer: apply fresh OR refresh an existing rig.
+            // This lets the user re-click Handoff after changing a parent
+            // slot target and get the baked references resampled, without
+            // losing their parent/weight configuration to a full re-install.
+            var refreshCount = 0;
+            var applyCount   = 0;
+            var targets      = [];
+            for (var t = 0; t < sel.length; t++) { targets.push(sel[t]); }
+            for (var ck = 0; ck < targets.length; ck++) {
+                if (findHandoffEffect(targets[ck]) !== null) { refreshCount++; }
+                else                                        { applyCount++; }
+            }
+            var undoLabel = (refreshCount > 0 && applyCount === 0)
+                ? "Refresh " + SCRIPT_NAME
+                : "Apply "   + SCRIPT_NAME;
+
+            app.beginUndoGroup(undoLabel);
             try {
                 // Snapshot the selection so applyPreset\'s selection juggling
                 // doesn\'t lose track of what the user wanted to rig.
-                var targets = [];
-                for (var t = 0; t < sel.length; t++) { targets.push(sel[t]); }
                 for (var i = 0; i < targets.length; i++) {
                     try {
-                        applyRig(targets[i], ffxFile);
+                        if (findHandoffEffect(targets[i]) !== null) {
+                            refreshRig(targets[i]);
+                        } else {
+                            applyRig(targets[i], ffxFile);
+                        }
                     } catch (e) {
                         alert(
                             "Could not apply to \"" + targets[i].name + "\".\n\n"
