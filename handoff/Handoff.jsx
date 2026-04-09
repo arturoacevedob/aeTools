@@ -429,6 +429,14 @@
         'if (typeof HANDOFF_BAKED_APPLY_OFFSET_POS !== "undefined") {',
         '    total = sub(total, HANDOFF_BAKED_APPLY_OFFSET_POS);',
         '}',
+        '// Child-drift guard: if the child moved since baking, suppress ALL',
+        '// tracking to prevent a visible jump. The poll rebakes in ~100ms.',
+        'if (typeof HANDOFF_BAKED_CHILD_REST !== "undefined") {',
+        '    var _cd = sub(value, HANDOFF_BAKED_CHILD_REST);',
+        '    if (Math.abs(_cd[0]) > 0.5 || Math.abs(_cd[1]) > 0.5) {',
+        '        total = [0, 0, 0];',
+        '    }',
+        '}',
         ''
     ].join('\n');
 
@@ -2499,6 +2507,16 @@
         if (fx === null) {
             throw new Error("No Handoff rig found on the selected layer. Apply one first.");
         }
+        // Clear existing expressions BEFORE writeExpressions snapshots the
+        // target visual. Without this, the snapshot captures the old rig's
+        // stale-bake output, and the two-pass offset locks in the wrong pos.
+        var tg = layer.property("ADBE Transform Group");
+        safeClearExpression(tg.property("ADBE Position"));
+        safeClearExpression(tg.property("ADBE Position_0"));
+        safeClearExpression(tg.property("ADBE Position_1"));
+        safeClearExpression(tg.property("ADBE Position_2"));
+        safeClearExpression(tg.property("ADBE Rotate Z"));
+        safeClearExpression(tg.property("ADBE Scale"));
         writeExpressions(layer, fx);
     }
 
