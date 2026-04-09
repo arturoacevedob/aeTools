@@ -1,6 +1,6 @@
 /*
     Handoff — ScriptUI Panel
-    Version: 1.1.0
+    Version: 1.1.1
 
     Weighted, switchable, sticky dynamic parenting for After Effects.
 
@@ -2084,7 +2084,9 @@
         var comp = layer.containingComp;
         var tmpNull = comp.layers.addNull();
         tmpNull.name = "__handoff_bake__";
-        var probePos = propByMatchPath(tmpNull, "ADBE Transform Group#1/ADBE Position#1");
+        // Use stock ExtendScript property access — propByMatchPath is an
+        // atom-ae runtime helper that doesn\'t exist in plain AE sessions.
+        var probePos = tmpNull.property("ADBE Transform Group").property("ADBE Position");
 
         // Child rest pose at t=0, read pre-expression (raw keyframed value).
         // For separated dimensions we read each scalar and assemble a vector.
