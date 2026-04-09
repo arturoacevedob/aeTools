@@ -1,6 +1,6 @@
 /*
     Handoff — ScriptUI Panel
-    Version: 1.1.2
+    Version: 1.2.0
 
     Weighted, switchable, sticky dynamic parenting for After Effects.
 
@@ -380,23 +380,20 @@
         '    }',
         '}',
         '',
-        '// Rigid fallback for static parents (no transform keys). The segment',
-        '// walker above contributes 0 for static parents because fromWorld and',
-        '// toWorld use the same transform at tA and tB (round-trip identity).',
-        '// This loop adds live-drag feedback by comparing each parent CURRENT',
-        '// transform against the APPLY-TIME transform baked into HANDOFF_BAKED_*.',
+        '// Rigid tracking for parents with constant weight (no weight keyframes).',
+        '// Uses the baked pLocal (expression-probe-accurate) to track the parent',
+        '// full transform: position + rotation orbit + scale radial — matching',
+        '// native AE parenting. Parents with weight keyframes are handled by the',
+        '// segment walker above instead (to capture crossfade/handoff transitions).',
         'if (typeof HANDOFF_BAKED_LOCAL_P !== "undefined") {',
         '    for (var _rp = 1; _rp <= ' + SLOTS + '; _rp++) {',
         '        var _rwp = wPosSafe(_rp);',
         '        if (_rwp === null) { continue; }',
+        '        if (_rwp.numKeys > 0) { continue; }',
         '        var _rwVal = clamp01(_rwp.value);',
         '        if (_rwVal === 0) { continue; }',
         '        try {',
         '            var _rlyr = FX("P" + _rp + " Layer");',
-        '            var _rHasKeys = _rlyr.transform.position.numKeys > 1 ||',
-        '                            _rlyr.transform.rotation.numKeys > 1 ||',
-        '                            _rlyr.transform.scale.numKeys > 1;',
-        '            if (_rHasKeys) { continue; }',
         '            var _rTracked = _rlyr.toWorld(HANDOFF_BAKED_LOCAL_P[_rp - 1], time);',
         '            var _rDelta   = sub(_rTracked, HANDOFF_BAKED_CHILD_REST);',
         '            total = add(total, mul(_rDelta, _rwVal));',
@@ -423,11 +420,22 @@
     // Both guards are wrapped in `typeof !== "undefined"` so that a manually
     // assigned expression without a bake prefix still runs (no clamp, no
     // offset, same as the old pre-fix behavior).
+    // Apply-time offset subtraction. The two-pass in writeExpressions
+    // measures the rig's output at apply_time and stores the delta as
+    // APPLY_OFFSET_POS. Subtracting it anchors the visual at apply_time.
+    // No pre-apply clamp — the rigid fallback tracks at all times,
+    // matching native AE parenting behavior.
     var POSITION_APPLY = [
-        'if (typeof HANDOFF_BAKED_APPLY_TIME !== "undefined" && time < HANDOFF_BAKED_APPLY_TIME) {',
-        '    total = [0, 0, 0];',
-        '} else if (typeof HANDOFF_BAKED_APPLY_OFFSET_POS !== "undefined") {',
+        'if (typeof HANDOFF_BAKED_APPLY_OFFSET_POS !== "undefined") {',
         '    total = sub(total, HANDOFF_BAKED_APPLY_OFFSET_POS);',
+        '}',
+        '// Child-drift guard: if the child moved since baking, suppress ALL',
+        '// tracking to prevent a visible jump. The poll rebakes in ~100ms.',
+        'if (typeof HANDOFF_BAKED_CHILD_REST !== "undefined") {',
+        '    var _cd = sub(value, HANDOFF_BAKED_CHILD_REST);',
+        '    if (Math.abs(_cd[0]) > 0.5 || Math.abs(_cd[1]) > 0.5) {',
+        '        total = [0, 0, 0];',
+        '    }',
         '}',
         ''
     ].join('\n');
@@ -505,29 +513,24 @@
         '    try { total += rOff(p); } catch (e) {}',
         '}',
         '',
-        '// Rigid fallback for static parents (see Position expression above).',
+        '// Rigid rotation tracking for constant-weight parents.',
         'if (typeof HANDOFF_BAKED_ROT_P !== "undefined") {',
         '    for (var _rp = 1; _rp <= ' + SLOTS + '; _rp++) {',
         '        var _rwp;',
         '        try { _rwp = wPropFor(_rp, "Rotation"); } catch (_re) { continue; }',
+        '        if (_rwp.numKeys > 0) { continue; }',
         '        var _rwVal = clamp01(_rwp.value);',
         '        if (_rwVal === 0) { continue; }',
         '        try {',
         '            var _rlyr = FX("P" + _rp + " Layer");',
-        '            var _rHasKeys = _rlyr.transform.position.numKeys > 1 ||',
-        '                            _rlyr.transform.rotation.numKeys > 1 ||',
-        '                            _rlyr.transform.scale.numKeys > 1;',
-        '            if (_rHasKeys) { continue; }',
         '            var _rDelta = unwrap(worldRot(_rlyr, time) - HANDOFF_BAKED_ROT_P[_rp - 1]);',
         '            total += _rDelta * _rwVal;',
         '        } catch (_re) {}',
         '    }',
         '}',
         '',
-        '// Apply-time anchoring (see Position expression for details).',
-        'if (typeof HANDOFF_BAKED_APPLY_TIME !== "undefined" && time < HANDOFF_BAKED_APPLY_TIME) {',
-        '    total = 0;',
-        '} else if (typeof HANDOFF_BAKED_APPLY_OFFSET_ROT !== "undefined") {',
+        '// Apply-time offset subtraction.',
+        'if (typeof HANDOFF_BAKED_APPLY_OFFSET_ROT !== "undefined") {',
         '    total = total - HANDOFF_BAKED_APPLY_OFFSET_ROT;',
         '}',
         'value + total;'
@@ -607,19 +610,16 @@
         '    try { totalLog = add(totalLog, sOff(p, n)); } catch (e) {}',
         '}',
         '',
-        '// Rigid fallback for static parents (see Position expression above).',
+        '// Rigid scale tracking for constant-weight parents.',
         'if (typeof HANDOFF_BAKED_SCALE_P !== "undefined") {',
         '    for (var _rp = 1; _rp <= ' + SLOTS + '; _rp++) {',
         '        var _rwp;',
         '        try { _rwp = wPropFor(_rp, "Scale"); } catch (_re) { continue; }',
+        '        if (_rwp.numKeys > 0) { continue; }',
         '        var _rwVal = clamp01(_rwp.value);',
         '        if (_rwVal === 0) { continue; }',
         '        try {',
         '            var _rlyr = FX("P" + _rp + " Layer");',
-        '            var _rHasKeys = _rlyr.transform.position.numKeys > 1 ||',
-        '                            _rlyr.transform.rotation.numKeys > 1 ||',
-        '                            _rlyr.transform.scale.numKeys > 1;',
-        '            if (_rHasKeys) { continue; }',
         '            var _rCur = worldScale(_rlyr, time);',
         '            totalLog[0] += Math.log(_rCur[0] / HANDOFF_BAKED_SCALE_P[_rp - 1][0]) * _rwVal;',
         '            totalLog[1] += Math.log(_rCur[1] / HANDOFF_BAKED_SCALE_P[_rp - 1][1]) * _rwVal;',
@@ -627,12 +627,8 @@
         '    }',
         '}',
         '',
-        '// Apply-time anchoring (see Position expression for details).',
-        '// log-space: subtracting equals dividing by the baked scale factor',
-        '// at apply time, which makes result(apply_time) * exp(0) = value.',
-        'if (typeof HANDOFF_BAKED_APPLY_TIME !== "undefined" && time < HANDOFF_BAKED_APPLY_TIME) {',
-        '    for (var _tc = 0; _tc < n; _tc++) { totalLog[_tc] = 0; }',
-        '} else if (typeof HANDOFF_BAKED_APPLY_OFFSET_LOG_SCALE !== "undefined") {',
+        '// Apply-time offset subtraction (log-space).',
+        'if (typeof HANDOFF_BAKED_APPLY_OFFSET_LOG_SCALE !== "undefined") {',
         '    totalLog[0] -= HANDOFF_BAKED_APPLY_OFFSET_LOG_SCALE[0];',
         '    totalLog[1] -= HANDOFF_BAKED_APPLY_OFFSET_LOG_SCALE[1];',
         '}',
@@ -2086,19 +2082,20 @@
     // apply flow look messy. The manual math below handles parent-of-parent
     // chains recursively by composing each layer\'s local transform with
     // its ancestor\'s world transform.
-    function computeBakes(layer, fx) {
-        // Child rest pose at t=0, read pre-expression (raw keyframed value).
-        // For separated dimensions we read each scalar and assemble a vector.
+    function computeBakes(layer, fx, bakeTime) {
+        // Child rest pose at bakeTime (playhead), read pre-expression (raw
+        // keyframed value). For separated dims we read each scalar and
+        // assemble a vector.
         var childRest;
         var childTG = layer.property("ADBE Transform Group");
         var childPos = childTG.property("ADBE Position");
         if (childPos.dimensionsSeparated) {
-            var cx = childTG.property("ADBE Position_0").valueAtTime(0, true);
-            var cy = childTG.property("ADBE Position_1").valueAtTime(0, true);
-            var cz = layer.threeDLayer ? childTG.property("ADBE Position_2").valueAtTime(0, true) : 0;
+            var cx = childTG.property("ADBE Position_0").valueAtTime(bakeTime, true);
+            var cy = childTG.property("ADBE Position_1").valueAtTime(bakeTime, true);
+            var cz = layer.threeDLayer ? childTG.property("ADBE Position_2").valueAtTime(bakeTime, true) : 0;
             childRest = [cx, cy, cz];
         } else {
-            var cv = childPos.valueAtTime(0, true);
+            var cv = childPos.valueAtTime(bakeTime, true);
             childRest = [cv[0], cv[1], cv[2] || 0];
         }
 
@@ -2119,19 +2116,31 @@
             }
             var parentLayer = layer.containingComp.layer(layerIdx);
 
-            // pLocal = parent.fromWorld(childRest, 0). Manual recursive
-            // inverse transform that walks the parent chain from the top
-            // down — converts childRest from world to the leaf layer\'s
-            // local coordinate frame, passing through each ancestor.
-            bakes.localP.push(worldToLayerLocal(parentLayer, childRest, 0));
+            // pLocal = parent.fromWorld(childRest, bakeTime). We use an
+            // expression probe on the child's position property rather than
+            // manual ExtendScript math. The manual worldToLayerLocal function
+            // diverges from AE's internal transform pipeline when the parent
+            // has rotation or scale, producing wrong pLocal values that break
+            // the toWorld round-trip. The expression engine's fromWorld is
+            // authoritative.
+            var probeTarget = childPos.dimensionsSeparated
+                ? childTG.property("ADBE Position_0")
+                : childPos;
+            probeTarget.expression =
+                "thisComp.layer(" + parentLayer.index + ").fromWorld([" +
+                childRest[0] + "," + childRest[1] + "," + (childRest[2] || 0) + "], " +
+                bakeTime + ");";
+            var pLocal = probeTarget.valueAtTime(bakeTime, false);
+            probeTarget.expression = "";
+            bakes.localP.push([pLocal[0], pLocal[1], pLocal[2] || 0]);
 
-            // Parent\'s world Z rotation at t=0, accumulated through the
-            // parent chain.
-            bakes.rotP.push(accumulatedRotation(parentLayer, 0));
+            // Parent's world Z rotation at bakeTime, accumulated through
+            // the parent chain.
+            bakes.rotP.push(accumulatedRotation(parentLayer, bakeTime));
 
-            // Parent\'s world X/Y scale at t=0, accumulated through the
-            // parent chain (multiplicative).
-            bakes.scaleP.push(accumulatedScale(parentLayer, 0));
+            // Parent's world X/Y scale at bakeTime, accumulated through
+            // the parent chain (multiplicative).
+            bakes.scaleP.push(accumulatedScale(parentLayer, bakeTime));
         }
 
         return bakes;
@@ -2399,7 +2408,7 @@
         var targetScl = sclP.valueAtTime(now, false);
 
         // --- Step 2: compute bakes.
-        var bakes = computeBakes(layer, fx);
+        var bakes = computeBakes(layer, fx, now);
 
         // --- Step 3: Pass 1. Zero offsets, apply_time sentinel -1e18 so
         // the clamp is inactive and the rig runs at full strength at now.
@@ -2499,6 +2508,19 @@
             throw new Error("No Handoff rig found on the selected layer. Apply one first.");
         }
         writeExpressions(layer, fx);
+    }
+
+    // ---- Test/automation hook --------------------------------------------------
+    if (typeof $ !== "undefined" && $.global) {
+        $.global.__handoff_applyById = function (layerId) {
+            var layer = app.project.layerByID(layerId);
+            var fx = findHandoffEffect(layer);
+            if (fx !== null) {
+                refreshRig(layer);
+            } else {
+                applyRig(layer, ensureFFX());
+            }
+        };
     }
 
     // ---- UI ------------------------------------------------------------------
