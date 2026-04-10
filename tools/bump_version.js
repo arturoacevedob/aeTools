@@ -42,6 +42,13 @@ const JSX_TARGETS = [
     path.join(ROOT, 'handoff', 'Handoff.jsx'),
 ];
 
+// Additional files with version strings in other formats.
+const EXTRA_TARGETS = [
+    { file: path.join(ROOT, 'handoff', 'cep', 'com.aetools.handoff', 'index.html'),
+      pattern: /v\d+\.\d+\.\d+/,
+      replace: function(v) { return 'v' + v; } },
+];
+
 function parseSemver(versionStr) {
     var m = versionStr.trim().match(/^(\d+)\.(\d+)\.(\d+)$/);
     if (!m) {
@@ -106,6 +113,21 @@ function main() {
 
     if (updated === 0) {
         console.warn('No .jsx targets updated. Did you forget the "Version: X.Y.Z" line?');
+    }
+
+    for (var j = 0; j < EXTRA_TARGETS.length; j++) {
+        var et = EXTRA_TARGETS[j];
+        if (!fs.existsSync(et.file)) {
+            console.warn('  WARN: skipping missing target ' + et.file);
+            continue;
+        }
+        var content = fs.readFileSync(et.file, 'utf8');
+        if (!et.pattern.test(content)) {
+            console.warn('  WARN: no version match in ' + path.basename(et.file));
+            continue;
+        }
+        fs.writeFileSync(et.file, content.replace(et.pattern, et.replace(newStr)));
+        console.log('  ' + path.relative(ROOT, et.file) + ': updated to ' + newStr);
     }
 }
 

@@ -1,6 +1,6 @@
 /*
     Handoff — ScriptUI Panel
-    Version: 1.5.4
+    Version: 1.5.5
 
     Weighted, switchable, sticky dynamic parenting for After Effects.
 
@@ -1903,10 +1903,11 @@
         if (!dir.exists) { dir.create(); }
         var ffx = new File(dir.fsName + "/" + FFX_CACHE_NAME);
 
-        // If the cached file is missing OR its size doesn't match the
-        // embedded payload, rewrite it. (Catches the case where the user
-        // updates the script to a new schema — the cache gets refreshed.)
-        var needsWrite = !ffx.exists || ffx.length !== HANDOFF_FFX_BINARY.length;
+        // Always rewrite the cached FFX from the embedded payload. This
+        // ensures label/schema changes are picked up immediately without
+        // requiring manual cache deletion. The file is small (~38KB) and
+        // the write takes milliseconds.
+        var needsWrite = true;
         if (needsWrite) {
             if (HANDOFF_FFX_BINARY.length === 0) {
                 throw new Error(
