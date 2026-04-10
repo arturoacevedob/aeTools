@@ -8,9 +8,15 @@ body {
 
 #panel {
     display: flex;
-    gap: 4px;
-    padding: 6px;
+    flex-direction: column;
     height: 100vh;
+    padding: 6px;
+    gap: 4px;
+}
+
+#toolbar {
+    display: flex;
+    gap: 4px;
 }
 
 #btn-handoff {
@@ -34,3 +40,34 @@ body {
 }
 
 button:active { opacity: 0.7; }
+
+#statusbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    font-size: 12px;
+    opacity: 0.4;
+    padding: 0 2px;
+}
+
+#status-left {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+}
+
+#status-dot {
+    display: inline-block;
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: #888;
+}
+
+#status-dot.green  { background: #4caf50; }
+#status-dot.amber  { background: #ff9800; }
+#status-dot.red    { background: #f44336; }
+
+#status-text, #status-version {
+    user-select: none;
+}

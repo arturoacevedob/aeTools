@@ -6,6 +6,16 @@
     // Key: layerId (string), Value: {parents, weights, postPos, postRot, postScl, time}
     var cache = {};
 
+    // ---- Status bar ----
+
+    var statusDot  = document.getElementById("status-dot");
+    var statusText = document.getElementById("status-text");
+
+    function setStatus(color, text) {
+        statusDot.className = color;
+        statusText.textContent = text;
+    }
+
     // ---- Theme ----
 
     function applyTheme() {
@@ -102,10 +112,16 @@
             ? 'cepReadRigState(true)'
             : 'cepReadRigState()';
         csInterface.evalScript(cmd, function (result) {
-            if (result === "EvalScript error." || !result) { return; }
+            if (result === "EvalScript error." || !result) {
+                setStatus("red", "Disconnected");
+                return;
+            }
             var state;
             try { state = JSON.parse(result); } catch (e) { return; }
-            if (!state.active || !state.rigged) { return; }
+            if (!state.active || !state.rigged) {
+                setStatus("", "Idle");
+                return;
+            }
 
             _anySettling = false;
 
@@ -173,6 +189,7 @@
                     // a layer or a keyframe. Update cache but DON'T rebake.
                     // Keep previous postPos/restPos (light mode returns nulls).
                     _anySettling = true;
+                    setStatus("amber", "Settling");
                     cache[lyr.id] = {
                         parents: lyr.parents.slice(),
                         weights: lyr.weights.slice(),
@@ -236,6 +253,8 @@
                         continue;
                     }
 
+                    setStatus("amber", "Rebaking");
+
                     if (preserveVisual) {
                         // Parent changed or weight dropped to 0: preserve the
                         // child's current visual position through the rebake.
@@ -280,6 +299,11 @@
             }
             for (var key in cache) {
                 if (!riggedIds[key]) { delete cache[key]; }
+            }
+
+            // Status: tracking if any layers rigged and not settling
+            if (!_anySettling && state.rigged.length > 0) {
+                setStatus("green", "Tracking " + state.rigged.length + " layer" + (state.rigged.length > 1 ? "s" : ""));
             }
         });
     }
