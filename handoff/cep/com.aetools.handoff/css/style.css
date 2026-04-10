@@ -1,0 +1,36 @@
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+body {
+    font-family: "Adobe Clean", "Segoe UI", sans-serif;
+    font-size: 11px;
+    overflow: hidden;
+}
+
+#panel {
+    display: flex;
+    gap: 4px;
+    padding: 6px;
+    height: 100vh;
+}
+
+#btn-handoff {
+    flex: 1;
+    min-height: 32px;
+    border: none;
+    border-radius: 3px;
+    cursor: pointer;
+    font-size: 12px;
+    font-weight: 500;
+}
+
+#btn-remove {
+    width: 32px;
+    min-height: 32px;
+    border: none;
+    border-radius: 3px;
+    cursor: pointer;
+    font-size: 16px;
+    font-weight: bold;
+}
+
+button:active { opacity: 0.7; }

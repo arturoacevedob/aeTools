@@ -1,6 +1,6 @@
 /*
     Handoff — ScriptUI Panel
-    Version: 1.2.0
+    Version: 1.3.0
 
     Weighted, switchable, sticky dynamic parenting for After Effects.
 
@@ -381,12 +381,15 @@
         '}',
         '',
         '// Rigid tracking for parents with constant weight (no weight keyframes).',
-        '// Uses the baked pLocal (expression-probe-accurate) to track the parent',
-        '// full transform: position + rotation orbit + scale radial — matching',
-        '// native AE parenting. Parents with weight keyframes are handled by the',
-        '// segment walker above instead (to capture crossfade/handoff transitions).',
+        '// Skipped per-slot when:',
+        '//   1. Slot not populated at bake time (SLOTS_VALID)',
+        '//   2. Parent swapped: current parent index != baked index',
+        '// Child-moved detection is handled by the CEP poll (auto-rebake),',
+        '// not in the expression — skipping the rigid fallback on child move',
+        '// causes a visible flash to rest position.',
         'if (typeof HANDOFF_BAKED_LOCAL_P !== "undefined") {',
         '    for (var _rp = 1; _rp <= ' + SLOTS + '; _rp++) {',
+        '        if (typeof HANDOFF_BAKED_SLOTS_VALID !== "undefined" && !HANDOFF_BAKED_SLOTS_VALID[_rp - 1]) { continue; }',
         '        var _rwp = wPosSafe(_rp);',
         '        if (_rwp === null) { continue; }',
         '        if (_rwp.numKeys > 0) { continue; }',
@@ -394,6 +397,8 @@
         '        if (_rwVal === 0) { continue; }',
         '        try {',
         '            var _rlyr = FX("P" + _rp + " Layer");',
+        '            if (typeof HANDOFF_BAKED_PARENT_INDICES !== "undefined"',
+        '                && _rlyr.index !== HANDOFF_BAKED_PARENT_INDICES[_rp - 1]) { continue; }',
         '            var _rTracked = _rlyr.toWorld(HANDOFF_BAKED_LOCAL_P[_rp - 1], time);',
         '            var _rDelta   = sub(_rTracked, HANDOFF_BAKED_CHILD_REST);',
         '            total = add(total, mul(_rDelta, _rwVal));',
@@ -506,8 +511,10 @@
         '}',
         '',
         '// Rigid rotation tracking for constant-weight parents.',
+        '// Skipped when slot invalid or parent swapped (index mismatch).',
         'if (typeof HANDOFF_BAKED_ROT_P !== "undefined") {',
         '    for (var _rp = 1; _rp <= ' + SLOTS + '; _rp++) {',
+        '        if (typeof HANDOFF_BAKED_SLOTS_VALID !== "undefined" && !HANDOFF_BAKED_SLOTS_VALID[_rp - 1]) { continue; }',
         '        var _rwp;',
         '        try { _rwp = wPropFor(_rp, "Rotation"); } catch (_re) { continue; }',
         '        if (_rwp.numKeys > 0) { continue; }',
@@ -515,6 +522,8 @@
         '        if (_rwVal === 0) { continue; }',
         '        try {',
         '            var _rlyr = FX("P" + _rp + " Layer");',
+        '            if (typeof HANDOFF_BAKED_PARENT_INDICES !== "undefined"',
+        '                && _rlyr.index !== HANDOFF_BAKED_PARENT_INDICES[_rp - 1]) { continue; }',
         '            var _rDelta = unwrap(worldRot(_rlyr, time) - HANDOFF_BAKED_ROT_P[_rp - 1]);',
         '            total += _rDelta * _rwVal;',
         '        } catch (_re) {}',
@@ -603,8 +612,10 @@
         '}',
         '',
         '// Rigid scale tracking for constant-weight parents.',
+        '// Skipped when slot invalid or parent swapped (index mismatch).',
         'if (typeof HANDOFF_BAKED_SCALE_P !== "undefined") {',
         '    for (var _rp = 1; _rp <= ' + SLOTS + '; _rp++) {',
+        '        if (typeof HANDOFF_BAKED_SLOTS_VALID !== "undefined" && !HANDOFF_BAKED_SLOTS_VALID[_rp - 1]) { continue; }',
         '        var _rwp;',
         '        try { _rwp = wPropFor(_rp, "Scale"); } catch (_re) { continue; }',
         '        if (_rwp.numKeys > 0) { continue; }',
@@ -612,6 +623,8 @@
         '        if (_rwVal === 0) { continue; }',
         '        try {',
         '            var _rlyr = FX("P" + _rp + " Layer");',
+        '            if (typeof HANDOFF_BAKED_PARENT_INDICES !== "undefined"',
+        '                && _rlyr.index !== HANDOFF_BAKED_PARENT_INDICES[_rp - 1]) { continue; }',
         '            var _rCur = worldScale(_rlyr, time);',
         '            totalLog[0] += Math.log(_rCur[0] / HANDOFF_BAKED_SCALE_P[_rp - 1][0]) * _rwVal;',
         '            totalLog[1] += Math.log(_rCur[1] / HANDOFF_BAKED_SCALE_P[_rp - 1][1]) * _rwVal;',
@@ -2092,10 +2105,12 @@
         }
 
         var bakes = {
-            childRest: childRest,
-            localP:    [],
-            rotP:      [],
-            scaleP:    []
+            childRest:     childRest,
+            localP:        [],
+            rotP:          [],
+            scaleP:        [],
+            slotsValid:    [],
+            parentIndices: []
         };
 
         for (var p = 1; p <= SLOTS; p++) {
@@ -2104,8 +2119,12 @@
                 bakes.localP.push([0, 0, 0]);
                 bakes.rotP.push(0);
                 bakes.scaleP.push([1, 1]);
+                bakes.slotsValid.push(false);
+                bakes.parentIndices.push(0);
                 continue;
             }
+            bakes.slotsValid.push(true);
+            bakes.parentIndices.push(layerIdx);
             var parentLayer = layer.containingComp.layer(layerIdx);
 
             // pLocal = parent.fromWorld(childRest, bakeTime). We use an
@@ -2277,6 +2296,10 @@
         for (var j = 0; j < bakes.rotP.length; j++) { rotParts.push(bakes.rotP[j]); }
         var scaleParts = [];
         for (var k = 0; k < bakes.scaleP.length; k++) { scaleParts.push(fmt2(bakes.scaleP[k])); }
+        var validParts = [];
+        for (var v = 0; v < bakes.slotsValid.length; v++) { validParts.push(bakes.slotsValid[v] ? "true" : "false"); }
+        var idxParts = [];
+        for (var pi = 0; pi < bakes.parentIndices.length; pi++) { idxParts.push(bakes.parentIndices[pi]); }
 
         return "" +
             "// Baked references from applyRig (at the time this expression was set).\n" +
@@ -2287,6 +2310,8 @@
             "var HANDOFF_BAKED_LOCAL_P                = [" + localParts.join(",") + "];\n" +
             "var HANDOFF_BAKED_ROT_P                  = [" + rotParts.join(",") + "];\n" +
             "var HANDOFF_BAKED_SCALE_P                = [" + scaleParts.join(",") + "];\n" +
+            "var HANDOFF_BAKED_SLOTS_VALID            = [" + validParts.join(",") + "];\n" +
+            "var HANDOFF_BAKED_PARENT_INDICES         = [" + idxParts.join(",") + "];\n" +
             "var HANDOFF_BAKED_APPLY_TIME             = " + at + ";\n" +
             "var HANDOFF_BAKED_APPLY_OFFSET_POS       = " + fmt3(pOff) + ";\n" +
             "var HANDOFF_BAKED_APPLY_OFFSET_ROT       = " + rOff + ";\n" +
@@ -2512,7 +2537,61 @@
         writeExpressions(layer, fx);
     }
 
-    // ---- Test/automation hook --------------------------------------------------
+    // ---- CEP mode exports ----------------------------------------------------
+    //
+    // When loaded by the CEP panel's host.jsx via $.evalFile(), the IIFE still
+    // runs but we export the core functions to $.global instead of building the
+    // ScriptUI panel. host.jsx sets $.global.__handoff_cep = true before
+    // evalFile'ing this script. The `return` at the end of this block exits
+    // the IIFE, skipping buildUI entirely.
+    //
+    // This keeps ONE source of truth for all expression templates, baking
+    // logic, and rig functions — no code duplication between JSX and CEP.
+
+    if (typeof $ !== "undefined" && $.global && $.global.__handoff_cep) {
+        // Override ensureFFX to prefer the bundled .ffx from the CEP extension
+        // (path set by CEP panel via $.global.__handoff_ffx_path). Falls back
+        // to the embedded-binary cache if the CEP path is missing.
+        var _origEnsureFFX = ensureFFX;
+        ensureFFX = function () {
+            if ($.global.__handoff_ffx_path) {
+                var f = new File($.global.__handoff_ffx_path);
+                if (f.exists) { return f; }
+            }
+            return _origEnsureFFX();
+        };
+
+        $.global.__handoff = {
+            SLOTS:                SLOTS,
+            nLayer:               nLayer,
+            nWeight:              nWeight,
+            ensureFFX:            ensureFFX,
+            findHandoffEffect:    findHandoffEffect,
+            safeClearExpression:   safeClearExpression,
+            removeRig:            removeRig,
+            selectOnly:           selectOnly,
+            computeBakes:         computeBakes,
+            writeExpressions:     writeExpressions,
+            writeAllExpressions:  writeAllExpressions,
+            applyRig:             applyRig,
+            refreshRig:           refreshRig
+        };
+
+        // Also install the test/automation hook for atom-ae compatibility
+        $.global.__handoff_applyById = function (layerId) {
+            var layer = app.project.layerByID(layerId);
+            var fx = findHandoffEffect(layer);
+            if (fx !== null) {
+                refreshRig(layer);
+            } else {
+                applyRig(layer, ensureFFX());
+            }
+        };
+
+        return; // skip ScriptUI build — CEP panel handles UI
+    }
+
+    // ---- Test/automation hook (standalone mode) ------------------------------
     if (typeof $ !== "undefined" && $.global) {
         $.global.__handoff_applyById = function (layerId) {
             var layer = app.project.layerByID(layerId);
@@ -2525,7 +2604,7 @@
         };
     }
 
-    // ---- UI ------------------------------------------------------------------
+    // ---- UI (standalone ScriptUI mode) --------------------------------------
 
     function buildUI(thisObj) {
         var panel = (thisObj instanceof Panel)

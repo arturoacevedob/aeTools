@@ -1,0 +1,254 @@
+(function () {
+    var csInterface = new CSInterface();
+    var POLL_MS = 100;
+
+    // Cache of last-known rig state per layer ID.
+    // Key: layerId (string), Value: {parents, weights, postPos, postRot, postScl, time}
+    var cache = {};
+
+    // ---- Theme ----
+
+    function applyTheme() {
+        var env = csInterface.getHostEnvironment();
+        var bg = env.appSkinInfo.panelBackgroundColor.color;
+        var r = Math.round(bg.red), g = Math.round(bg.green), b = Math.round(bg.blue);
+        var bgColor = "rgb(" + r + "," + g + "," + b + ")";
+        var textColor = (r + g + b) / 3 < 128 ? "#ddd" : "#222";
+        var btnBg = (r + g + b) / 3 < 128
+            ? "rgb(" + Math.min(r + 30, 255) + "," + Math.min(g + 30, 255) + "," + Math.min(b + 30, 255) + ")"
+            : "rgb(" + Math.max(r - 30, 0) + "," + Math.max(g - 30, 0) + "," + Math.max(b - 30, 0) + ")";
+
+        document.body.style.backgroundColor = bgColor;
+        document.body.style.color = textColor;
+        var btns = document.querySelectorAll("button");
+        for (var i = 0; i < btns.length; i++) {
+            btns[i].style.backgroundColor = btnBg;
+            btns[i].style.color = textColor;
+        }
+    }
+
+    // ---- Paths ----
+
+    function initPaths() {
+        var extPath = csInterface.getSystemPath(SystemPath.EXTENSION);
+        // Normalize for ExtendScript (forward slashes)
+        extPath = extPath.replace(/\\/g, "/");
+
+        var ffxPath = extPath + "/assets/Handoff.ffx";
+        csInterface.evalScript('setFFXPath("' + ffxPath + '")');
+
+        // Tell host.jsx where the shared Handoff.jsx lives.
+        // In dev (symlink), it's ../../Handoff.jsx relative to the extension.
+        // We try the sibling path first, then fall back to the extension's
+        // own jsx/ directory (for packaged ZXP distribution where Handoff.jsx
+        // would be bundled alongside host.jsx).
+        var jsxPath = extPath + "/../../Handoff.jsx";
+        csInterface.evalScript('setHandoffJSXPath("' + jsxPath + '")');
+    }
+
+    // ---- DRY helper: get selected layer IDs ----
+
+    function getSelectedLayerIds(callback) {
+        csInterface.evalScript(
+            'var comp = app.project.activeItem;' +
+            'if (!(comp instanceof CompItem)) { "no_comp"; }' +
+            'else if (comp.selectedLayers.length === 0) { "no_sel"; }' +
+            'else {' +
+            '  var ids = [];' +
+            '  for (var i = 0; i < comp.selectedLayers.length; i++) {' +
+            '    ids.push(comp.selectedLayers[i].id);' +
+            '  }' +
+            '  ids.join(",");' +
+            '}',
+            function (result) {
+                if (result === "no_comp" || result === "no_sel" || !result) {
+                    return;
+                }
+                callback(result.split(","));
+            }
+        );
+    }
+
+    // ---- Button Handlers ----
+
+    document.getElementById("btn-handoff").addEventListener("click", function () {
+        getSelectedLayerIds(function (ids) {
+            for (var i = 0; i < ids.length; i++) {
+                csInterface.evalScript('cepApplyOrRefresh(' + ids[i] + ')');
+            }
+            // Clear cache so next poll picks up fresh state
+            cache = {};
+        });
+    });
+
+    document.getElementById("btn-remove").addEventListener("click", function () {
+        getSelectedLayerIds(function (ids) {
+            for (var i = 0; i < ids.length; i++) {
+                csInterface.evalScript('cepRemoveRig(' + ids[i] + ')');
+                delete cache[ids[i]];
+            }
+        });
+    });
+
+    // ---- Polling Loop ----
+
+    function poll() {
+        csInterface.evalScript('cepReadRigState()', function (result) {
+            if (result === "EvalScript error." || !result) { return; }
+            var state;
+            try { state = JSON.parse(result); } catch (e) { return; }
+            if (!state.active || !state.rigged) { return; }
+
+            for (var i = 0; i < state.rigged.length; i++) {
+                var lyr = state.rigged[i];
+                var prev = cache[lyr.id];
+
+                if (!prev) {
+                    // First time seeing this layer — cache and move on
+                    cache[lyr.id] = {
+                        parents: lyr.parents.slice(),
+                        weights: lyr.weights.slice(),
+                        restPos: lyr.restPos.slice(),
+                        postPos: lyr.postPos.slice(),
+                        postRot: lyr.postRot,
+                        postScl: lyr.postScl.slice(),
+                        time:    state.time
+                    };
+                    continue;
+                }
+
+                // Check for parent assignment changes
+                var parentChanged = false;
+                for (var p = 0; p < lyr.parents.length; p++) {
+                    if (lyr.parents[p] !== prev.parents[p]) {
+                        parentChanged = true;
+                        break;
+                    }
+                }
+
+                // Check for weight going from >0 to 0 (unparent)
+                var unparented = false;
+                for (var w = 0; w < lyr.weights.length; w++) {
+                    if (prev.weights[w] > 0.001 && lyr.weights[w] < 0.001) {
+                        unparented = true;
+                        break;
+                    }
+                }
+
+                // Check for child moved (rest position changed = user dragged child).
+                // DEBOUNCED: don't rebake while the user is actively dragging.
+                // Only rebake after the rest position stabilizes for 3 consecutive
+                // polls (~300ms), meaning the user released the mouse.
+                var childMoved = false;
+                if (lyr.restPos && prev.restPos) {
+                    var dx = Math.abs(lyr.restPos[0] - prev.restPos[0]);
+                    var dy = Math.abs(lyr.restPos[1] - prev.restPos[1]);
+                    if (dx > 0.5 || dy > 0.5) { childMoved = true; }
+                }
+
+                if (childMoved) {
+                    // Position still changing — user is dragging. Update cache
+                    // (track latest position) but DON'T rebake. Reset settle.
+                    cache[lyr.id] = {
+                        parents: lyr.parents.slice(),
+                        weights: lyr.weights.slice(),
+                        restPos: lyr.restPos.slice(),
+                        postPos: lyr.postPos.slice(),
+                        postRot: lyr.postRot,
+                        postScl: lyr.postScl.slice(),
+                        time:    state.time,
+                        settling: true,
+                        settleCount: 0
+                    };
+                    continue;
+                }
+
+                // Check if we're settling after a drag (position stopped changing)
+                var settledRebake = false;
+                if (prev.settling) {
+                    var sc = (prev.settleCount || 0) + 1;
+                    if (sc >= 3) {
+                        // Stable for 3 polls — user released mouse, rebake now
+                        settledRebake = true;
+                    } else {
+                        // Still settling — wait more
+                        cache[lyr.id] = {
+                            parents: lyr.parents.slice(),
+                            weights: lyr.weights.slice(),
+                            restPos: lyr.restPos.slice(),
+                            postPos: lyr.postPos.slice(),
+                            postRot: lyr.postRot,
+                            postScl: lyr.postScl.slice(),
+                            time:    state.time,
+                            settling: true,
+                            settleCount: sc
+                        };
+                        continue;
+                    }
+                }
+
+                var needsRebake = parentChanged || unparented || settledRebake;
+
+                if (needsRebake) {
+                    // Time guard: skip if playhead moved since we cached.
+                    if (Math.abs(state.time - prev.time) > 0.001) {
+                        cache[lyr.id] = {
+                            parents: lyr.parents.slice(),
+                            weights: lyr.weights.slice(),
+                            restPos: lyr.restPos.slice(),
+                            postPos: lyr.postPos.slice(),
+                            postRot: lyr.postRot,
+                            postScl: lyr.postScl.slice(),
+                            time:    state.time
+                        };
+                        continue;
+                    }
+
+                    // Use the CACHED post-expression visual (from before the
+                    // change) to preserve the child's position through the rebake.
+                    var cachedPos = JSON.stringify(prev.postPos);
+                    var cachedRot = prev.postRot;
+                    var cachedScl = JSON.stringify(prev.postScl);
+                    csInterface.evalScript(
+                        'cepPreserveAndRebake(' + lyr.id + ',' +
+                        "'" + cachedPos + "'," +
+                        cachedRot + ',' +
+                        "'" + cachedScl + "')"
+                    );
+                    // Clear cache so next poll treats this as "first seen"
+                    // instead of detecting the rebake's own changes as new
+                    // changes (which would cause a feedback loop).
+                    delete cache[lyr.id];
+                    continue;
+                }
+
+                // Update cache with current state
+                cache[lyr.id] = {
+                    parents: lyr.parents.slice(),
+                    weights: lyr.weights.slice(),
+                    restPos: lyr.restPos ? lyr.restPos.slice() : null,
+                    postPos: lyr.postPos.slice(),
+                    postRot: lyr.postRot,
+                    postScl: lyr.postScl.slice(),
+                    time:    state.time
+                };
+            }
+
+            // Remove cached entries for layers no longer rigged
+            var riggedIds = {};
+            for (var j = 0; j < state.rigged.length; j++) {
+                riggedIds[state.rigged[j].id] = true;
+            }
+            for (var key in cache) {
+                if (!riggedIds[key]) { delete cache[key]; }
+            }
+        });
+    }
+
+    // ---- Startup ----
+
+    applyTheme();
+    csInterface.addEventListener("com.adobe.csxs.events.ThemeColorChanged", applyTheme);
+    initPaths();
+    setInterval(poll, POLL_MS);
+})();
