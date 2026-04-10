@@ -239,7 +239,11 @@
 
                 if (preserveVisual || recompute) {
                     // Time guard: skip if playhead moved since we cached.
-                    if (Math.abs(state.time - prev.time) > 0.001) {
+                    // Only applies to visual-dependent rebakes (unparent uses
+                    // cached visual). Parent changes and keyframe settles use
+                    // refreshRig which reads apply time from the expression,
+                    // so they're safe regardless of playhead position.
+                    if (preserveVisual && Math.abs(state.time - prev.time) > 0.001) {
                         cache[lyr.id] = {
                             parents: lyr.parents.slice(),
                             weights: lyr.weights.slice(),
