@@ -102,6 +102,15 @@ function main() {
     console.log('Embedded ' + ffxBytes.length + ' bytes into Handoff.jsx');
     console.log('  ' + chunkLines + ' chunk lines, ' + CHUNK_BYTES + ' bytes per chunk');
     console.log('  Final .jsx size: ' + fs.statSync(JSX_PATH).size + ' bytes');
+
+    // Also copy the FFX to the CEP extension's assets folder so the
+    // bundled copy stays in sync with the source of truth.
+    const CEP_ASSETS = path.join(ROOT, 'handoff', 'cep', 'com.aetools.handoff', 'assets');
+    const CEP_FFX = path.join(CEP_ASSETS, 'Handoff.ffx');
+    if (fs.existsSync(CEP_ASSETS)) {
+        fs.copyFileSync(FFX_PATH, CEP_FFX);
+        console.log('  Copied to ' + path.relative(ROOT, CEP_FFX));
+    }
 }
 
 main();
