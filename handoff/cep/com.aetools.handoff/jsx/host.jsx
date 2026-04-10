@@ -137,11 +137,16 @@ function cepReadRigState(lightMode) {
             parents.push(fx.property(H.nLayer(p)).value);
             var wp = fx.property(H.nWeight(p));
             weights.push(wp.value);
-            // Build a hash of keyframe count + times for change detection.
-            // When keyframes are moved/added/removed, this string changes.
-            weightKeyHash += wp.numKeys;
-            for (var wk = 1; wk <= wp.numKeys; wk++) {
-                weightKeyHash += ":" + wp.keyTime(wk).toFixed(4);
+            // Build a hash from keyframe count + interpolated values at two
+            // sentinel times. Avoids reading individual keyTime() values,
+            // which forces AE to resolve keyframe overlaps during active
+            // drags and causes keyframes to jump forward.
+            var nk = wp.numKeys;
+            weightKeyHash += nk;
+            if (nk > 0) {
+                weightKeyHash += ":" + wp.valueAtTime(0, false).toFixed(4);
+                weightKeyHash += ":" + wp.valueAtTime(comp.duration * 0.5, false).toFixed(4);
+                weightKeyHash += ":" + wp.valueAtTime(comp.duration, false).toFixed(4);
             }
             weightKeyHash += "|";
         }
