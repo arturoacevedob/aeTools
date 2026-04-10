@@ -64,12 +64,15 @@ function setFFXPath(path) {
 // ---- CEP-callable wrapper functions --------------------------------------
 // These return JSON strings. main.js parses the results in callbacks.
 
-function cepApplyOrRefresh(layerId) {
+function cepApplyOrRefresh(layerId, useUndo) {
     _ensureLoaded();
     var H = $.global.__handoff;
     var layer = app.project.layerByID(layerId);
     var fx = H.findHandoffEffect(layer);
-    app.beginUndoGroup("Handoff");
+    // useUndo: true for manual button clicks (user expects an undo entry),
+    // false/omitted for CEP auto-rebakes (folds into the previous undo
+    // entry so Cmd+Z undoes both the user action and the rebake at once).
+    if (useUndo) { app.beginUndoGroup("Handoff"); }
     try {
         if (fx !== null) {
             H.refreshRig(layer);
@@ -78,7 +81,7 @@ function cepApplyOrRefresh(layerId) {
         }
         _registryAdd(layerId);
     } finally {
-        app.endUndoGroup();
+        if (useUndo) { app.endUndoGroup(); }
     }
     return JSON.stringify({ok: true});
 }
@@ -211,7 +214,8 @@ function cepPreserveAndRebake(layerId, cachedPosJson, cachedRot, cachedSclJson) 
     // Save apply time BEFORE clearing expressions (v1.3.2 pattern)
     var savedApplyTime = H.readOldApplyTime(layer);
 
-    app.beginUndoGroup("Handoff Auto-Update");
+    // No explicit undo group — folds into the previous undo entry
+    // (the user's weight change) so Cmd+Z undoes both at once.
     try {
         var tg = layer.property("ADBE Transform Group");
         var posU = tg.property("ADBE Position");
@@ -242,8 +246,6 @@ function cepPreserveAndRebake(layerId, cachedPosJson, cachedRot, cachedSclJson) 
         if (fx !== null) {
             H.writeExpressions(layer, fx, savedApplyTime);
         }
-    } finally {
-        app.endUndoGroup();
-    }
+    } finally {}
     return JSON.stringify({ok: true});
 }

@@ -1,6 +1,6 @@
 /*
     Handoff — ScriptUI Panel
-    Version: 1.4.1
+    Version: 1.4.2
 
     Weighted, switchable, sticky dynamic parenting for After Effects.
 
