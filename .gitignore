@@ -4,3 +4,8 @@
 # Kept out of the repo to avoid bloating git history with large third-party
 # content. If you want any of this committed, remove the entry below.
 resources/
+
+# ZXP build artifacts
+certs/
+dist/
+_build_staging/

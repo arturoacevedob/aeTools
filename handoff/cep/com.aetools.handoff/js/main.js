@@ -64,12 +64,15 @@
         csInterface.evalScript('setFFXPath("' + ffxPath + '")');
 
         // Tell host.jsx where the shared Handoff.jsx lives.
-        // In dev (symlink), it's ../../Handoff.jsx relative to the extension.
-        // We try the sibling path first, then fall back to the extension's
-        // own jsx/ directory (for packaged ZXP distribution where Handoff.jsx
-        // would be bundled alongside host.jsx).
-        var jsxPath = extPath + "/../../Handoff.jsx";
-        csInterface.evalScript('setHandoffJSXPath("' + jsxPath + '")');
+        // Dev (symlink): ../../Handoff.jsx relative to the extension.
+        // Production (ZXP): jsx/Handoff.jsx bundled inside the extension.
+        // Try dev path first; fall back to bundled path if it doesn't exist.
+        var devPath = extPath + "/../../Handoff.jsx";
+        var bundledPath = extPath + "/jsx/Handoff.jsx";
+        csInterface.evalScript(
+            'var _f = new File("' + devPath + '");' +
+            'setHandoffJSXPath(_f.exists ? "' + devPath + '" : "' + bundledPath + '")'
+        );
     }
 
     // ---- DRY helper: get selected layer IDs ----
