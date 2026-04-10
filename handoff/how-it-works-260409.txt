@@ -1,0 +1,278 @@
+## Handoff v1.3.x — Complete System Architecture
+
+### 1. What It Does (One Sentence)
+
+Handoff lets you dynamically parent a layer to up to 5 parent layers with
+per-parent weights — the child inherits each parent's *delta motion*
+(position + rotation orbit + scale radial) weighted by a 0-1 slider.
+A CEP panel auto-rebakes when the configuration changes, eliminating
+manual refresh clicks.
+
+---
+
+### 2. Two Delivery Modes
+
+```
+CEP Panel (primary)                    Standalone JSX (fallback)
+├── main.js (100ms polling)            ├── Handoff.jsx (IIFE)
+│   └── evalScript → host.jsx         │   ├── ScriptUI panel
+│       └── $.evalFile(Handoff.jsx)    │   ├── Embedded .ffx binary
+│           └── $.global.__handoff     │   └── Manual rebake on click
+├── Auto-rebake on changes             └── No auto-rebake
+└── Visual preservation on unparent
+```
+
+Both modes use the SAME Handoff.jsx source. In CEP mode, the IIFE
+detects `$.global.__handoff_cep === true` and exports functions to
+`$.global.__handoff` instead of building ScriptUI.
+
+---
+
+### 3. High-Level Data Flow
+
+```
+┌──────────────────────────────────────────────────────────┐
+│                    USER CLICKS "HANDOFF"                  │
+└──────────────────────┬───────────────────────────────────┘
+                       │
+              ┌────────▼────────┐
+              │ Has Handoff fx? │
+              └───┬─────────┬───┘
+                  │no       │yes
+          ┌───────▼───┐ ┌───▼──────────┐
+          │ applyRig  │ │  refreshRig  │
+          └───────┬───┘ └───┬──────────┘
+                  │         │ (saves old applyTime
+                  │         │  BEFORE clearing exprs)
+    ┌─────────────▼─────────▼────────────────┐
+    │       writeExpressions(layer, fx,       │
+    │                        savedApplyTime)  │
+    │                                         │
+    │  1. Snapshot target visual at applyTime │
+    │  2. computeBakes() at applyTime         │
+    │  3. Pass 1: write exprs, zero offsets   │
+    │  4. Read pass1 values at applyTime      │
+    │  5. offset = pass1 - target             │
+    │  6. Pass 2: write exprs, real offsets   │
+    │     → Layer doesn't jump                │
+    └─────────────────────────────────────────┘
+                       │
+        ┌──────────────▼──────────────┐
+        │  3 EXPRESSIONS NOW LIVE ON: │
+        │  • Position (or X/Y/Z)      │
+        │  • Rotation Z               │
+        │  • Scale                    │
+        └──────────────┬──────────────┘
+                       │
+        ┌──────────────▼──────────────────────┐
+        │  CEP POLLING LOOP (100ms)            │
+        │  Reads: parent indices, weights,     │
+        │         weight keyframe hash,        │
+        │         child rest pos, post-expr    │
+        │                                      │
+        │  On parent/unparent change:          │
+        │    → cepPreserveAndRebake            │
+        │      (preserve post-expression visual)│
+        │                                      │
+        │  On keyframe/child-move change:      │
+        │    → cepApplyOrRefresh               │
+        │      (recompute from rest position)  │
+        └─────────────────────────────────────┘
+```
+
+---
+
+### 4. Pseudo Effect Schema (per layer)
+
+```
+effect("Handoff")
+ │
+ ├── "P1 Layer"                    ← Layer picker (index)
+ ├── "P1 Weight"                   ← Shared weight [0..1], default=1
+ ├── "P1 Use Individual Weights"   ← Checkbox (0/1)
+ ├── "P1 Position"                 ← Pos-only weight [0..1]
+ ├── "P1 Scale"                    ← Scl-only weight [0..1]
+ ├── "P1 Rotation"                 ← Rot-only weight [0..1]
+ │
+ └── ... (5 slots total, P1-P5)
+```
+
+`wPropFor(p, channel)` reads the checkbox at eval time:
+if off → returns `"P{n} Weight"`, if on → returns `"P{n} {channel}"`.
+
+---
+
+### 5. Baked Variables (prepended to every expression)
+
+```javascript
+var HANDOFF_BAKED_CHILD_REST       = [x, y, z];         // Child's position at bake time
+var HANDOFF_BAKED_LOCAL_P           = [[x,y,z], ...x5];  // parent.fromWorld(childRest) per slot
+var HANDOFF_BAKED_ROT_P             = [r1, ...x5];       // accumulatedRotation per parent
+var HANDOFF_BAKED_SCALE_P           = [[sx,sy], ...x5];  // accumulatedScale per parent
+var HANDOFF_BAKED_SLOTS_VALID       = [bool, ...x5];     // Was slot populated at bake time?
+var HANDOFF_BAKED_PARENT_INDICES    = [idx, ...x5];      // Parent layer index at bake time
+var HANDOFF_BAKED_APPLY_TIME        = t;                 // comp.time when rig was first applied
+var HANDOFF_BAKED_APPLY_OFFSET_POS  = [dx, dy, dz];     // Position offset to subtract
+var HANDOFF_BAKED_APPLY_OFFSET_ROT  = dr;                // Rotation offset to subtract
+var HANDOFF_BAKED_APPLY_OFFSET_LOG_SCALE = [dlx, dly];   // Log-scale offset to subtract
+```
+
+---
+
+### 6. The Three Expression Engines
+
+#### 6A. POSITION — Segment-based integration + Rigid fallback
+
+```
+SEGMENT WALKER (all parents, live fromWorld/toWorld):
+  Union all parents' weight keyframes → sorted boundaries [0, kf1, ..., time]
+  For each segment [tA, tB]:
+    childA = rest(tA) + total_so_far     ← shared across ALL parents
+    For each active parent:
+      pLocal = parent.fromWorld(childA, tA)   ← "sticky" attach
+      ├─ Constant weight, single parent → FAST PATH (one toWorld)
+      └─ Variable weight or multi-parent → RIEMANN SUM (frame-by-frame)
+
+RIGID FALLBACK (static parents only):
+  Skip if:
+    1. SLOTS_VALID[p] === false         (slot empty at bake time)
+    2. _rlyr.index !== PARENT_INDICES[p] (parent swapped since bake)
+    3. _rlyr.position.numKeys > 0       (parent keyframed → walker handles it)
+    4. weight.numKeys > 0               (weight keyframed → walker handles it)
+  If all checks pass:
+    tracked = parent.toWorld(BAKED_LOCAL_P[p], time)
+    delta = tracked - BAKED_CHILD_REST
+    total += delta * weight
+
+APPLY OFFSET:
+  total -= BAKED_APPLY_OFFSET_POS
+
+RESULT = add(value, total)
+```
+
+#### 6B. ROTATION — Frame-by-frame Riemann sum (ALWAYS)
+
+```
+worldRot(lyr, t) = atan2(lyr.toWorld([100,0],t) - lyr.toWorld([0,0],t))
+
+unwrap(d): clamp to +/-180 degrees
+
+rOff(p): ALWAYS frame-by-frame accumulation
+  for each frame [0..time]:
+    off += unwrap(worldRot(lyr, tNext) - worldRot(lyr, tPrev)) * weight
+  (Never use closed-form unwrap(rB - rA) over full segments
+   — fails for cumulative rotation >180 degrees)
+
+RIGID FALLBACK: same skip rules as position
+RESULT = value + total - BAKED_APPLY_OFFSET_ROT
+```
+
+#### 6C. SCALE — Log-space integration
+
+```
+worldScale(lyr, t) = [length(toWorld([100,0],t) - toWorld([0,0],t)) / 100,
+                      length(toWorld([0,100],t) - toWorld([0,0],t)) / 100]
+
+sOff(p): integrates log(scale_ratio) per axis
+  Constant weight → logD(worldScale(0), worldScale(time)) * weight
+  Variable weight → Riemann sum of logD per frame
+
+RIGID FALLBACK: same skip rules as position
+RESULT = value * exp(totalLog - BAKED_APPLY_OFFSET_LOG_SCALE)
+```
+
+---
+
+### 7. CEP Polling Loop — Change Detection
+
+```
+Every 100ms:
+┌─────────────────────────────────────────────────────┐
+│ evalScript('cepReadRigState()')  [READ ONLY, no undo]│
+│                                                      │
+│ Returns per rigged layer:                            │
+│   parents[], weights[], weightKeyHash,               │
+│   restPos[], postPos[], postRot, postScl[], time     │
+│                                                      │
+│ Compare to cached state:                             │
+│                                                      │
+│ parents[p] changed?                                  │
+│   → cepPreserveAndRebake (preserve visual)           │
+│                                                      │
+│ weights[w] went >0 to 0?                             │
+│   → cepPreserveAndRebake (preserve visual)           │
+│                                                      │
+│ weightKeyHash changed? (keys moved/added/removed)    │
+│   → DEBOUNCE (wait for settle) → cepApplyOrRefresh   │
+│                                                      │
+│ restPos changed? (child dragged)                     │
+│   → DEBOUNCE (wait for 3 stable polls ~300ms)        │
+│   → cepApplyOrRefresh                                │
+│                                                      │
+│ After any rebake: delete cache[id] to prevent loop   │
+└─────────────────────────────────────────────────────┘
+```
+
+**Key distinction between the two rebake paths:**
+- `cepPreserveAndRebake`: clears expressions, sets rest value to cached
+  post-expression visual, then writes new expressions. Keeps the child
+  where it visually WAS. Used for parent changes and unparenting.
+- `cepApplyOrRefresh`: calls refreshRig which clears expressions and
+  recomputes from the child's actual rest position. Used for keyframe
+  changes and child moves. NEVER uses cached post-expression values
+  (they may be corrupt from stale offsets).
+
+---
+
+### 8. Apply-Time Preservation
+
+```
+refreshRig(layer):
+  1. savedApplyTime = readOldApplyTime(layer)  ← BEFORE clearing!
+  2. Clear all transform expressions
+  3. writeExpressions(layer, fx, savedApplyTime)
+       └── uses savedApplyTime for snapshot, bake, AND offset calibration
+           (not comp.time, which could be anywhere on the timeline)
+```
+
+This ensures the rig stays anchored at its original apply time (typically
+t=0) regardless of where the playhead is when a CEP-triggered rebake fires.
+Without this, rebaking at frame 29 would make tracking correct only at
+frame 29 but wrong at frame 1.
+
+---
+
+### 9. Rigid Fallback Skip Rules (all 3 expressions)
+
+```
+For each parent slot p:
+  │
+  ├─ SLOTS_VALID[p] === false?     → SKIP (slot was empty at bake time)
+  ├─ weight.numKeys > 0?           → SKIP (segment walker handles keyframed weights)
+  ├─ weight.value === 0?           → SKIP (parent inactive)
+  ├─ _rlyr.index !== PARENT_INDICES[p]? → SKIP (parent layer swapped)
+  ├─ _rlyr.position.numKeys > 0?  → SKIP (segment walker handles keyframed parents)
+  ├─ _rlyr.rotation.numKeys > 0?  → SKIP (same)
+  ├─ _rlyr.scale.numKeys > 0?     → SKIP (same)
+  │
+  └─ ALL checks pass → RUN rigid fallback
+     (parent is static, no keyframes anywhere, bakes are authoritative)
+```
+
+The rigid fallback ONLY adds value for purely static parents being dragged
+in the viewport. For everything else, the segment walker is sufficient.
+
+---
+
+### 10. Key Bugs Found and Fixed (v1.3.0-v1.3.2)
+
+| Bug | Root Cause | Fix |
+|-----|-----------|-----|
+| Child jumps to parent anchor on assign | Bakes computed with no parents (all zeros) | SLOTS_VALID guard skips unbaked slots |
+| Wrong rotation/scale/orbit | Rigid fallback double-counts for keyframed parents | Skip rigid fallback if parent has transform keyframes |
+| Rotation changes when weight keyframe added | Closed-form unwrap clips cumulative >180 degrees | Frame-by-frame Riemann sum for all rotation |
+| Tracking wrong after rebake at non-zero time | Apply-time lost when refreshRig clears expressions | Save applyTime BEFORE clearing, pass to writeExpressions |
+| Child flashes to rest on drag | _restFresh check snaps to rest for one poll cycle | Remove check, let CEP debounced rebake handle it |
+| Cascading position corruption | cepPreserveAndRebake bakes garbage visual into rest | Use cepApplyOrRefresh for keyframe/child-move changes |
+| Cursor fighting during child drag | Auto-rebake fires setValue while user is dragging | Debounce: wait 3 stable polls before rebake |
+| Parent swap flash | Old parent's baked pLocal used with new parent | Parent-index comparison skips mismatched slots |
