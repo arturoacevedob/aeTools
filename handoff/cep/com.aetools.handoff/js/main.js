@@ -108,6 +108,7 @@
                     cache[lyr.id] = {
                         parents: lyr.parents.slice(),
                         weights: lyr.weights.slice(),
+                        wkh:     lyr.wkh || "",
                         restPos: lyr.restPos.slice(),
                         postPos: lyr.postPos.slice(),
                         postRot: lyr.postRot,
@@ -135,6 +136,15 @@
                     }
                 }
 
+                // Check for weight keyframe changes (moved/added/removed).
+                // The wkh (weight key hash) is a string encoding the count
+                // and times of all weight keyframes. When it changes, the
+                // BAKED_APPLY_OFFSET is stale and needs recalibration.
+                var keysChanged = false;
+                if ((lyr.wkh || "") !== (prev.wkh || "")) {
+                    keysChanged = true;
+                }
+
                 // Check for child moved (rest position changed = user dragged child).
                 // DEBOUNCED: don't rebake while the user is actively dragging.
                 // Only rebake after the rest position stabilizes for 3 consecutive
@@ -146,12 +156,13 @@
                     if (dx > 0.5 || dy > 0.5) { childMoved = true; }
                 }
 
-                if (childMoved) {
-                    // Position still changing — user is dragging. Update cache
-                    // (track latest position) but DON'T rebake. Reset settle.
+                if (childMoved || keysChanged) {
+                    // Position or keyframes still changing — user is dragging
+                    // a layer or a keyframe. Update cache but DON'T rebake.
                     cache[lyr.id] = {
                         parents: lyr.parents.slice(),
                         weights: lyr.weights.slice(),
+                        wkh:     lyr.wkh || "",
                         restPos: lyr.restPos.slice(),
                         postPos: lyr.postPos.slice(),
                         postRot: lyr.postRot,
@@ -168,13 +179,12 @@
                 if (prev.settling) {
                     var sc = (prev.settleCount || 0) + 1;
                     if (sc >= 3) {
-                        // Stable for 3 polls — user released mouse, rebake now
                         settledRebake = true;
                     } else {
-                        // Still settling — wait more
                         cache[lyr.id] = {
                             parents: lyr.parents.slice(),
                             weights: lyr.weights.slice(),
+                            wkh:     lyr.wkh || "",
                             restPos: lyr.restPos.slice(),
                             postPos: lyr.postPos.slice(),
                             postRot: lyr.postRot,
@@ -187,14 +197,19 @@
                     }
                 }
 
-                var needsRebake = parentChanged || unparented || settledRebake;
+                // Two rebake paths depending on what changed:
+                //   preserveVisual: parent swap or unparent — keep child where it IS
+                //   recompute: keyframe change or child move — recompute from rest
+                var preserveVisual = parentChanged || unparented;
+                var recompute = settledRebake || keysChanged;
 
-                if (needsRebake) {
+                if (preserveVisual || recompute) {
                     // Time guard: skip if playhead moved since we cached.
                     if (Math.abs(state.time - prev.time) > 0.001) {
                         cache[lyr.id] = {
                             parents: lyr.parents.slice(),
                             weights: lyr.weights.slice(),
+                            wkh:     lyr.wkh || "",
                             restPos: lyr.restPos.slice(),
                             postPos: lyr.postPos.slice(),
                             postRot: lyr.postRot,
@@ -204,20 +219,26 @@
                         continue;
                     }
 
-                    // Use the CACHED post-expression visual (from before the
-                    // change) to preserve the child's position through the rebake.
-                    var cachedPos = JSON.stringify(prev.postPos);
-                    var cachedRot = prev.postRot;
-                    var cachedScl = JSON.stringify(prev.postScl);
-                    csInterface.evalScript(
-                        'cepPreserveAndRebake(' + lyr.id + ',' +
-                        "'" + cachedPos + "'," +
-                        cachedRot + ',' +
-                        "'" + cachedScl + "')"
-                    );
-                    // Clear cache so next poll treats this as "first seen"
-                    // instead of detecting the rebake's own changes as new
-                    // changes (which would cause a feedback loop).
+                    if (preserveVisual) {
+                        // Parent changed or weight dropped to 0: preserve the
+                        // child's current visual position through the rebake.
+                        var cachedPos = JSON.stringify(prev.postPos);
+                        var cachedRot = prev.postRot;
+                        var cachedScl = JSON.stringify(prev.postScl);
+                        csInterface.evalScript(
+                            'cepPreserveAndRebake(' + lyr.id + ',' +
+                            "'" + cachedPos + "'," +
+                            cachedRot + ',' +
+                            "'" + cachedScl + "')"
+                        );
+                    } else {
+                        // Keyframes changed or child moved: recompute the rig
+                        // from the child's current rest position. DON'T use
+                        // cached post-expression visual — it may be corrupt
+                        // from stale bakes.
+                        csInterface.evalScript('cepApplyOrRefresh(' + lyr.id + ')');
+                    }
+
                     delete cache[lyr.id];
                     continue;
                 }
@@ -226,6 +247,7 @@
                 cache[lyr.id] = {
                     parents: lyr.parents.slice(),
                     weights: lyr.weights.slice(),
+                    wkh:     lyr.wkh || "",
                     restPos: lyr.restPos ? lyr.restPos.slice() : null,
                     postPos: lyr.postPos.slice(),
                     postRot: lyr.postRot,

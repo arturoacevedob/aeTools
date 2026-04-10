@@ -129,9 +129,18 @@ function cepReadRigState() {
 
         var parents = [];
         var weights = [];
+        var weightKeyHash = "";
         for (var p = 1; p <= H.SLOTS; p++) {
             parents.push(fx.property(H.nLayer(p)).value);
-            weights.push(fx.property(H.nWeight(p)).value);
+            var wp = fx.property(H.nWeight(p));
+            weights.push(wp.value);
+            // Build a hash of keyframe count + times for change detection.
+            // When keyframes are moved/added/removed, this string changes.
+            weightKeyHash += wp.numKeys;
+            for (var wk = 1; wk <= wp.numKeys; wk++) {
+                weightKeyHash += ":" + wp.keyTime(wk).toFixed(4);
+            }
+            weightKeyHash += "|";
         }
 
         var tg = lyr.property("ADBE Transform Group");
@@ -167,6 +176,7 @@ function cepReadRigState() {
             id:       lyr.id,
             name:     lyr.name,
             parents:  parents,
+            wkh:      weightKeyHash,
             weights:  weights,
             restPos:  [restPos[0], restPos[1], restPos[2] || 0],
             postPos:  [postPos[0], postPos[1], postPos[2] || 0],
