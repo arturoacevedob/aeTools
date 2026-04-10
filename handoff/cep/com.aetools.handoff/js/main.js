@@ -84,7 +84,7 @@
     document.getElementById("btn-handoff").addEventListener("click", function () {
         getSelectedLayerIds(function (ids) {
             for (var i = 0; i < ids.length; i++) {
-                csInterface.evalScript('cepApplyOrRefresh(' + ids[i] + ',true)');
+                csInterface.evalScript('cepApplyOrRefresh(' + ids[i] + ')');
             }
             // Clear cache so next poll picks up fresh state
             cache = {};
