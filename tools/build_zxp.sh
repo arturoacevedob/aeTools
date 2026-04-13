@@ -36,7 +36,7 @@ fi
 if [ ! -f "$CERT_FILE" ]; then
     echo "Creating self-signed certificate..."
     mkdir -p "$CERT_DIR"
-    ZXPSignCmd -selfSignedCert US CA aeTools aeTools "$CERT_FILE" "$CERT_PASS"
+    ZXPSignCmd -selfSignedCert US CA aeTools aeTools "$CERT_PASS" "$CERT_FILE"
     echo "Certificate created: $CERT_FILE"
 fi
 
