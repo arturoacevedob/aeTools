@@ -153,9 +153,20 @@ ctrl.toWorld([localX, localY, 0]);
 
 ### `Transform/Opacity`
 
-**No expression.** Opacity is left at 100 on every layer for the user to
-keyframe themselves. Fade-out is handled by `vGallery Tint` (image fades
-into Fade Color) — opacity is not part of the rig.
+Hard cutoff to 0 outside the fade zone for performance — AE skips rendering
+opacity-zero layers. Inside the fade zone, returns `value`, which is the
+layer's underlying static value or keyframes. User keyframing is preserved.
+
+```js
+var ctrl = thisComp.layer("<CTRL>");
+var spacing = ctrl.effect("vGallery")("Spacing");
+var visRange = ctrl.effect("vGallery")("Visible Range");
+var totalLen = ctrl.effect("vGallery")("Total Length");
+var p = effect("vGallery Travel Location")("Slider");
+var distFromApex = Math.min(p, totalLen - p);
+var visDist = visRange * spacing;
+if (visDist <= 0 || distFromApex > visDist) { 0; } else { value; }
+```
 
 ### `vGallery Tint` — Amount to Tint
 

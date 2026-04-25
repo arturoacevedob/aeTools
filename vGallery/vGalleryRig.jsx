@@ -1,5 +1,5 @@
 // vGalleryRig.jsx — V-shape gallery rig applier for After Effects
-// Version: 1.8.1
+// Version: 1.9.0
 //
 // Drop into After Effects' Scripts/ScriptUI Panels/ folder, restart AE,
 // open via Window menu. See vGallery/README.md for usage.
@@ -725,6 +725,19 @@
                 "var visDist = visRange * spacing;\n" +
                 "if (visDist <= 0) { 100; } else { linear(distFromApex, 0, visDist, 0, 100); }",
 
+            // Opacity: hard cutoff to 0 outside the fade zone (AE skips rendering invisible
+            // layers — performance win). Inside the fade zone we return `value`, which is
+            // the layer's underlying opacity (so keyframes/static values are respected).
+            opacity:
+                "var ctrl = " + ref + ";\n" +
+                "var spacing = ctrl.effect(\"vGallery\")(\"Spacing\");\n" +
+                "var visRange = ctrl.effect(\"vGallery\")(\"Visible Range\");\n" +
+                "var totalLen = ctrl.effect(\"vGallery\")(\"Total Length\");\n" +
+                "var p = effect(\"vGallery Travel Location\")(\"Slider\");\n" +
+                "var distFromApex = Math.min(p, totalLen - p);\n" +
+                "var visDist = visRange * spacing;\n" +
+                "if (visDist <= 0 || distFromApex > visDist) { 0; } else { value; }",
+
             fadeColor:
                 ref + ".effect(\"vGallery\")(\"Fade Color\")",
 
@@ -817,7 +830,10 @@
         ds.property("ADBE Drop Shadow-0004").expression = exprs.shadowDistance;
         ds.property("ADBE Drop Shadow-0005").expression = exprs.shadowSoftness;
 
-        // Opacity: deliberately not touched (per user requirement — reserved for keyframing)
+        // Opacity: hard cutoff via expression so layers outside the fade zone go to
+        // opacity 0 and AE skips rendering. Inside the zone we return `value`, so
+        // user keyframes/static opacity are preserved.
+        layer.transform.opacity.expression = exprs.opacity;
     }
 
     $.global.__vGalleryRig.nameStartsWithVgPrefix = nameStartsWithVgPrefix;
@@ -833,13 +849,9 @@
             return;
         }
         var lines = [];
-        lines.push(r.rigged.length + " rigged successfully.");
+        lines.push(r.rigged.length + " rigged.");
         if (r.autoRenamed.length > 0) {
-            lines.push("");
-            lines.push(r.autoRenamed.length + " auto-renamed:");
-            for (var i = 0; i < r.autoRenamed.length; i++) {
-                lines.push("  • " + r.autoRenamed[i].from + " → " + r.autoRenamed[i].to);
-            }
+            lines.push(r.autoRenamed.length + " auto-renamed (vG_ prefix added).");
         }
         if (r.skipped.length > 0) {
             lines.push("");
@@ -981,6 +993,9 @@
                         } else {
                             L.transform.position.expression = "";
                         }
+                    }
+                    if (L.transform && L.transform.opacity) {
+                        L.transform.opacity.expression = "";
                     }
                 } catch (perLayerErr) {
                     // Silent — Remove Rig is best-effort
